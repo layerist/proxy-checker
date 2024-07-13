@@ -45,20 +45,6 @@ python check_proxies.py proxies.txt working_proxies.txt
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 ```
 
-### `requirements.txt`
-
-```plaintext
-requests
-```
-
-### License: `LICENSE`
-
-```plaintext
-MIT License
-
-[Full license text here]
-```
-
 ### Usage Instructions
 
 1. **Clone the repository**:
