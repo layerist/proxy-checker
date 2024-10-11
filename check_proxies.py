@@ -2,8 +2,9 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from pathlib import Path
+import time
 
-# Configure logging
+# Configure logging with timestamps and levels
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def read_proxies(file_path):
@@ -67,7 +68,7 @@ def check_proxy(proxy, retries=3):
         try:
             response = requests.get(url, proxies=proxies, timeout=5)
             if response.status_code == 200:
-                logging.info(f"Working proxy: {proxy}")
+                logging.info(f"Working proxy: {proxy} (IP: {response.json()['origin']})")
                 return proxy
         except requests.RequestException as e:
             logging.warning(f"Proxy {proxy} failed on attempt {attempt}/{retries}: {e}")
@@ -82,27 +83,31 @@ def write_proxies(file_path, proxies):
         file_path (str): Path to the file where working proxies will be written.
         proxies (list): List of working proxies.
     """
+    file_path = Path(file_path)
     try:
-        with open(file_path, 'w') as file:
+        with file_path.open('w') as file:
             file.writelines(f"{proxy}\n" for proxy in proxies)
         logging.info(f"Successfully wrote {len(proxies)} working proxies to {file_path}")
     except Exception as e:
         logging.error(f"Error writing proxies to file {file_path}: {e}")
 
-def main(input_file, output_file):
+def main(input_file, output_file, max_workers=10):
     """
     Main function to load, check, and save working proxies.
     Args:
         input_file (str): File path to input proxy list.
         output_file (str): File path to save working proxies.
+        max_workers (int): Number of threads to use for parallel proxy checking.
     """
+    start_time = time.time()
+
     proxies = read_proxies(input_file)
     if not proxies:
         logging.error("No proxies to process. Exiting.")
         return
 
     working_proxies = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_proxy = {executor.submit(check_proxy, proxy): proxy for proxy in proxies}
 
         for future in as_completed(future_to_proxy):
@@ -120,10 +125,13 @@ def main(input_file, output_file):
     else:
         logging.info("No working proxies found.")
 
+    logging.info(f"Finished processing in {time.time() - start_time:.2f} seconds")
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Check and filter working proxies.')
     parser.add_argument('input_file', help='File with list of proxies in ip:port[:username:password] format')
     parser.add_argument('output_file', help='Output file for working proxies')
+    parser.add_argument('--max_workers', type=int, default=10, help='Number of threads to use for proxy checking')
     args = parser.parse_args()
-    main(args.input_file, args.output_file)
+    main(args.input_file, args.output_file, args.max_workers)
