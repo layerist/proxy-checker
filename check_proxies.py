@@ -3,6 +3,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from pathlib import Path
 import time
+import urllib3
+
+# Suppress warnings from urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging with timestamps and levels
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,13 +70,13 @@ def check_proxy(proxy, retries=3):
     url = 'http://httpbin.org/ip'
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(url, proxies=proxies, timeout=5)
+            response = requests.get(url, proxies=proxies, timeout=5, verify=False)
             if response.status_code == 200:
                 logging.info(f"Working proxy: {proxy} (IP: {response.json()['origin']})")
                 return proxy
         except requests.RequestException as e:
-            logging.warning(f"Proxy {proxy} failed on attempt {attempt}/{retries}: {e}")
-    
+            logging.debug(f"Proxy {proxy} failed on attempt {attempt}/{retries}: {e}")
+
     logging.info(f"Non-working proxy: {proxy}")
     return None
 
@@ -130,8 +134,13 @@ def main(input_file, output_file, max_workers=10):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Check and filter working proxies.')
-    parser.add_argument('input_file', help='File with list of proxies in ip:port[:username:password] format')
-    parser.add_argument('output_file', help='Output file for working proxies')
+    parser.add_argument('input_file', type=str, help='File with list of proxies in ip:port[:username:password] format')
+    parser.add_argument('output_file', type=str, help='Output file for working proxies')
     parser.add_argument('--max_workers', type=int, default=10, help='Number of threads to use for proxy checking')
     args = parser.parse_args()
-    main(args.input_file, args.output_file, args.max_workers)
+
+    # Validate max_workers for positive integer
+    if args.max_workers < 1:
+        logging.error("Max workers must be a positive integer. Exiting.")
+    else:
+        main(args.input_file, args.output_file, args.max_workers)
