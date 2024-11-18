@@ -11,6 +11,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Configure logging with timestamps and levels
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
 def read_proxies(file_path):
     """
     Reads proxies from a file and returns a list of valid proxy strings.
@@ -25,13 +26,14 @@ def read_proxies(file_path):
         return []
 
     try:
-        with file_path.open('r') as file:
+        with file_path.open('r', encoding='utf-8') as file:
             proxies = [line.strip() for line in file if line.strip()]
         logging.info(f"Loaded {len(proxies)} proxies from {file_path}")
         return proxies
     except Exception as e:
         logging.error(f"Error reading proxies from file {file_path}: {e}")
         return []
+
 
 def parse_proxy(proxy):
     """
@@ -54,12 +56,14 @@ def parse_proxy(proxy):
 
     return {'http': proxy_url, 'https': proxy_url}
 
-def check_proxy(proxy, retries=3):
+
+def check_proxy(proxy, retries=3, timeout=5):
     """
     Checks if a proxy is working by sending a request through it.
     Args:
         proxy (str): Proxy string in format ip:port or ip:port:username:password.
         retries (int): Number of retry attempts for a proxy.
+        timeout (int): Timeout in seconds for the request.
     Returns:
         str: The proxy string if it is working, otherwise None.
     """
@@ -70,15 +74,16 @@ def check_proxy(proxy, retries=3):
     url = 'http://httpbin.org/ip'
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(url, proxies=proxies, timeout=5, verify=False)
+            response = requests.get(url, proxies=proxies, timeout=timeout, verify=False)
             if response.status_code == 200:
-                logging.info(f"Working proxy: {proxy} (IP: {response.json()['origin']})")
+                logging.info(f"Working proxy: {proxy} (IP: {response.json().get('origin')})")
                 return proxy
         except requests.RequestException as e:
             logging.debug(f"Proxy {proxy} failed on attempt {attempt}/{retries}: {e}")
 
     logging.info(f"Non-working proxy: {proxy}")
     return None
+
 
 def write_proxies(file_path, proxies):
     """
@@ -89,11 +94,12 @@ def write_proxies(file_path, proxies):
     """
     file_path = Path(file_path)
     try:
-        with file_path.open('w') as file:
+        with file_path.open('w', encoding='utf-8') as file:
             file.writelines(f"{proxy}\n" for proxy in proxies)
         logging.info(f"Successfully wrote {len(proxies)} working proxies to {file_path}")
     except Exception as e:
         logging.error(f"Error writing proxies to file {file_path}: {e}")
+
 
 def main(input_file, output_file, max_workers=10):
     """
@@ -129,17 +135,19 @@ def main(input_file, output_file, max_workers=10):
     else:
         logging.info("No working proxies found.")
 
-    logging.info(f"Finished processing in {time.time() - start_time:.2f} seconds")
+    elapsed_time = time.time() - start_time
+    logging.info(f"Finished processing in {elapsed_time:.2f} seconds")
+
 
 if __name__ == '__main__':
     import argparse
+
     parser = argparse.ArgumentParser(description='Check and filter working proxies.')
     parser.add_argument('input_file', type=str, help='File with list of proxies in ip:port[:username:password] format')
     parser.add_argument('output_file', type=str, help='Output file for working proxies')
     parser.add_argument('--max_workers', type=int, default=10, help='Number of threads to use for proxy checking')
     args = parser.parse_args()
 
-    # Validate max_workers for positive integer
     if args.max_workers < 1:
         logging.error("Max workers must be a positive integer. Exiting.")
     else:
