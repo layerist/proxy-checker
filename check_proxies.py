@@ -10,7 +10,10 @@ from typing import List, Optional, Dict
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging with timestamps and levels
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 def read_proxies(file_path: str) -> List[str]:
     """
@@ -23,7 +26,7 @@ def read_proxies(file_path: str) -> List[str]:
         List[str]: A list of proxies read from the file.
     """
     path = Path(file_path)
-    if not path.exists():
+    if not path.is_file():
         logging.error(f"File not found: {file_path}")
         return []
 
@@ -76,7 +79,7 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
         return None
 
     test_url = "http://httpbin.org/ip"
-    for attempt in range(retries):
+    for attempt in range(1, retries + 1):
         try:
             response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
             if response.status_code == 200:
@@ -84,7 +87,7 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
                 logging.info(f"Working proxy: {proxy} (IP: {origin_ip})")
                 return proxy
         except requests.RequestException as e:
-            logging.debug(f"Proxy {proxy} failed (attempt {attempt + 1}/{retries}): {e}")
+            logging.debug(f"Proxy {proxy} failed (attempt {attempt}/{retries}): {e}")
 
     logging.info(f"Non-working proxy: {proxy}")
     return None
