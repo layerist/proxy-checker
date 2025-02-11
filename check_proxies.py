@@ -18,12 +18,6 @@ logging.basicConfig(
 def read_proxies(file_path: str) -> List[str]:
     """
     Reads proxies from a file and returns a list of valid proxy strings.
-
-    Args:
-        file_path (str): Path to the file containing proxy addresses.
-
-    Returns:
-        List[str]: A list of proxies read from the file.
     """
     path = Path(file_path)
     if not path.is_file():
@@ -36,18 +30,12 @@ def read_proxies(file_path: str) -> List[str]:
         logging.info(f"Loaded {len(proxies)} proxies from {file_path}")
         return proxies
     except Exception as e:
-        logging.error(f"Error reading proxies from file {file_path}: {e}")
+        logging.error(f"Error reading proxies from {file_path}: {e}")
         return []
 
 def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
     """
     Parses a proxy string into a requests-compatible proxy dictionary.
-
-    Args:
-        proxy (str): Proxy string in format ip:port or ip:port:username:password.
-
-    Returns:
-        Optional[Dict[str, str]]: A dictionary for use with requests or None if invalid format.
     """
     parts = proxy.split(":")
     if len(parts) == 2:
@@ -65,14 +53,6 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
 def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
     """
     Checks if a proxy is working by sending a request through it.
-
-    Args:
-        proxy (str): Proxy string in format ip:port or ip:port:username:password.
-        retries (int): Number of retry attempts for a proxy.
-        timeout (int): Timeout in seconds for the request.
-
-    Returns:
-        Optional[str]: The proxy string if it is working, otherwise None.
     """
     proxies = parse_proxy(proxy)
     if not proxies:
@@ -83,8 +63,7 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
         try:
             response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
             if response.status_code == 200:
-                origin_ip = response.json().get("origin")
-                logging.info(f"Working proxy: {proxy} (IP: {origin_ip})")
+                logging.info(f"Working proxy: {proxy} (IP: {response.json().get('origin')})")
                 return proxy
         except requests.RequestException as e:
             logging.debug(f"Proxy {proxy} failed (attempt {attempt}/{retries}): {e}")
@@ -95,10 +74,6 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
 def write_proxies(file_path: str, proxies: List[str]) -> None:
     """
     Writes working proxies to the specified output file.
-
-    Args:
-        file_path (str): Path to the file where working proxies will be written.
-        proxies (List[str]): List of working proxies.
     """
     path = Path(file_path)
     try:
@@ -111,11 +86,6 @@ def write_proxies(file_path: str, proxies: List[str]) -> None:
 def main(input_file: str, output_file: str, max_workers: int = 10) -> None:
     """
     Main function to load, check, and save working proxies.
-
-    Args:
-        input_file (str): File path to input proxy list.
-        output_file (str): File path to save working proxies.
-        max_workers (int): Number of threads to use for parallel proxy checking.
     """
     start_time = time.time()
 
