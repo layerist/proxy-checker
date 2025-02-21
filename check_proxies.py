@@ -119,7 +119,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_workers", type=int, default=10, help="Number of threads to use for proxy checking")
     args = parser.parse_args()
 
-    if args.max_workers < 1:
+    if args.max_workers < 2:
         logging.error("Max workers must be a positive integer. Exiting.")
     else:
         main(args.input_file, args.output_file, args.max_workers)
