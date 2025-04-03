@@ -9,7 +9,7 @@ from typing import List, Optional, Dict
 # Suppress warnings from urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configure logging with timestamps and levels
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -23,7 +23,6 @@ def read_proxies(file_path: str) -> List[str]:
     if not path.is_file():
         logging.error(f"File not found: {file_path}")
         return []
-
     try:
         with path.open("r", encoding="utf-8") as file:
             proxies = [line.strip() for line in file if line.strip()]
@@ -50,7 +49,7 @@ def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
     
     return {"http": proxy_url, "https": proxy_url}
 
-def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]:
+def check_proxy(proxy: str, timeout: int = 5) -> Optional[str]:
     """
     Checks if a proxy is working by sending a request through it.
     """
@@ -59,14 +58,13 @@ def check_proxy(proxy: str, retries: int = 3, timeout: int = 5) -> Optional[str]
         return None
     
     test_url = "http://httpbin.org/ip"
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
-            if response.status_code == 200:
-                logging.info(f"Working proxy: {proxy} (IP: {response.json().get('origin')})")
-                return proxy
-        except (requests.ConnectionError, requests.Timeout) as e:
-            logging.debug(f"Proxy {proxy} failed (attempt {attempt}/{retries}): {e}")
+    try:
+        response = requests.get(test_url, proxies=proxies, timeout=timeout, verify=False)
+        if response.status_code == 200:
+            logging.info(f"Working proxy: {proxy} (IP: {response.json().get('origin')})")
+            return proxy
+    except requests.RequestException as e:
+        logging.debug(f"Proxy {proxy} failed: {e}")
     
     logging.info(f"Non-working proxy: {proxy}")
     return None
@@ -88,7 +86,6 @@ def main(input_file: str, output_file: str, max_workers: int = 10) -> None:
     Main function to load, check, and save working proxies.
     """
     start_time = time.time()
-    
     proxies = read_proxies(input_file)
     if not proxies:
         logging.error("No proxies to process. Exiting.")
