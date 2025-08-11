@@ -1,6 +1,7 @@
 import argparse
 import logging
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Dict, TypedDict, Set
@@ -35,10 +36,12 @@ def read_proxies(file_path: Path) -> List[str]:
         logging.error(f"Input file not found: {file_path}")
         return []
     try:
-        lines = file_path.read_text(encoding="utf-8").splitlines()
+        lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         unique_proxies: Set[str] = {line.strip() for line in lines if line.strip()}
-        logging.info(f"Loaded {len(unique_proxies)} unique proxies.")
-        return list(unique_proxies)
+        proxies_list = list(unique_proxies)
+        random.shuffle(proxies_list)
+        logging.info(f"Loaded {len(proxies_list)} unique proxies.")
+        return proxies_list
     except Exception as e:
         logging.error(f"Failed to read proxies: {e}")
         return []
@@ -55,12 +58,12 @@ def parse_proxy_line(line: str) -> Optional[ProxyDict]:
             ip, port, user, pwd = parts
             auth = f"{user}:{pwd}@"
         else:
-            logging.debug(f"Ignored malformed proxy: {line}")
+            logging.debug(f"Malformed proxy ignored: {line}")
             return None
         proxy_url = f"http://{auth}{ip}:{port}"
         return {"http": proxy_url, "https": proxy_url}
     except Exception as e:
-        logging.debug(f"Error parsing proxy line: {line} — {e}")
+        logging.debug(f"Error parsing proxy line '{line}': {e}")
         return None
 
 
@@ -74,29 +77,25 @@ def make_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
         allowed_methods=["GET"],
         raise_on_status=False
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_maxsize=DEFAULT_MAX_WORKERS)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
 
-def check_proxy(proxy_line: str, url: str, timeout: int, https_only: bool) -> Optional[str]:
+def check_proxy(proxy_line: str, url: str, timeout: int, https_only: bool, session: requests.Session) -> Optional[str]:
     """Returns proxy line if it successfully connects to the test URL."""
     proxies = parse_proxy_line(proxy_line)
     if not proxies:
         return None
-
     if https_only:
         proxies["http"] = ""
-
-    session = make_session()
     try:
         response = session.get(url, proxies=proxies, timeout=timeout, verify=False)
         if response.ok:
-            logging.debug(f"Valid proxy: {proxy_line}")
             return proxy_line
-    except requests.RequestException as e:
-        logging.debug(f"Failed proxy: {proxy_line} — {e}")
+    except requests.RequestException:
+        pass
     return None
 
 
@@ -118,9 +117,11 @@ def validate_proxies_concurrently(
 ) -> List[str]:
     """Runs proxy validation in parallel using threads."""
     valid: List[str] = []
+    session = make_session()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(check_proxy, proxy, url, timeout, https_only): proxy
+            executor.submit(check_proxy, proxy, url, timeout, https_only, session): proxy
             for proxy in proxies
         }
         for future in tqdm(as_completed(futures), total=len(futures), desc="Checking proxies", ncols=80):
@@ -158,7 +159,7 @@ def main() -> None:
             proxies, args.test_url, args.timeout, args.max_workers, args.https_only
         )
     except KeyboardInterrupt:
-        logging.warning("Validation interrupted.")
+        logging.warning("Validation interrupted by user.")
         valid_proxies = []
 
     duration = time.time() - start
