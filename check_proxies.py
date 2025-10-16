@@ -1,11 +1,11 @@
 import argparse
 import logging
-import time
 import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Dict, TypedDict, Set
+from typing import List, Optional, Dict, Set, TypedDict
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -25,11 +25,13 @@ class ProxyDict(TypedDict, total=False):
     http: str
     https: str
 
+
 # Defaults
 DEFAULT_TEST_URL = "http://httpbin.org/ip"
 DEFAULT_TEST_URL_HTTPS = "https://httpbin.org/ip"
 DEFAULT_TIMEOUT = 5
 DEFAULT_MAX_WORKERS = 20
+DEFAULT_RETRIES = 3
 
 
 def read_proxies(file_path: Path) -> List[str]:
@@ -37,6 +39,7 @@ def read_proxies(file_path: Path) -> List[str]:
     if not file_path.exists():
         logging.error(f"Input file not found: {file_path}")
         return []
+
     try:
         lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         proxies = {line.strip() for line in lines if line.strip()}
@@ -66,8 +69,8 @@ def parse_proxy_line(line: str) -> Optional[ProxyDict]:
         return None
 
 
-def make_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
-    """Create a requests session with retry logic."""
+def make_session(retries: int = DEFAULT_RETRIES, backoff: float = 0.5) -> requests.Session:
+    """Create a requests session with retry logic and connection pooling."""
     session = requests.Session()
     retry_strategy = Retry(
         total=retries,
@@ -79,6 +82,7 @@ def make_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_maxsize=DEFAULT_MAX_WORKERS)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "ProxyChecker/1.2"})
     return session
 
 
@@ -93,18 +97,27 @@ def check_proxy(proxy_line: str, url: str, timeout: int, https_only: bool) -> Op
     session = make_session()
     try:
         # small random jitter to spread requests
-        time.sleep(random.uniform(0.05, 0.2))
+        time.sleep(random.uniform(0.05, 0.25))
         response = session.get(url, proxies=proxies, timeout=timeout, verify=False)
-        if response.ok:
+        if response.ok and response.text:
             return proxy_line
-    except requests.RequestException:
-        return None
+    except requests.exceptions.ProxyError:
+        pass
+    except requests.exceptions.ConnectTimeout:
+        pass
+    except requests.exceptions.ReadTimeout:
+        pass
+    except requests.RequestException as e:
+        logging.debug(f"Proxy {proxy_line} failed: {e}")
+    finally:
+        session.close()
     return None
 
 
 def write_proxies(path: Path, proxies: List[str]) -> None:
     """Write list of valid proxies to output file."""
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(proxies), encoding="utf-8")
         logging.info(f"Saved {len(proxies)} valid proxies to {path}")
     except Exception as e:
@@ -116,34 +129,35 @@ def validate_proxies_concurrently(
     url: str,
     timeout: int,
     max_workers: int,
-    https_only: bool
+    https_only: bool,
 ) -> List[str]:
     """Run proxy validation in parallel using threads."""
     valid: Set[str] = set()
+    total = len(proxies)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(check_proxy, proxy, url, timeout, https_only) for proxy in proxies]
+        futures = {executor.submit(check_proxy, proxy, url, timeout, https_only): proxy for proxy in proxies}
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Checking proxies", ncols=100):
+        for future in tqdm(as_completed(futures), total=total, desc="Checking proxies", ncols=90, dynamic_ncols=True):
             try:
                 result = future.result()
                 if result:
                     valid.add(result)
             except Exception as e:
-                logging.debug(f"Proxy check failed: {e}")
+                logging.debug(f"Proxy check raised exception: {e}")
 
     return sorted(valid)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Multithreaded proxy validator")
-    parser.add_argument("input_file", type=Path, help="Input file with proxy list")
+    parser = argparse.ArgumentParser(description="Fast multithreaded proxy validator")
+    parser.add_argument("input_file", type=Path, help="Input file with proxies")
     parser.add_argument("output_file", type=Path, help="Output file for valid proxies")
-    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Number of concurrent threads")
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Concurrent threads (default 20)")
     parser.add_argument("--test-url", type=str, default=DEFAULT_TEST_URL, help="URL to test proxies against")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout per proxy request (seconds)")
-    parser.add_argument("--https-only", action="store_true", help="Only validate HTTPS proxies")
-    parser.add_argument("--also-test-https", action="store_true", help="Re-test valid proxies against HTTPS URL")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout per request in seconds")
+    parser.add_argument("--https-only", action="store_true", help="Validate HTTPS only")
+    parser.add_argument("--also-test-https", action="store_true", help="Re-test valid proxies with HTTPS URL")
 
     args = parser.parse_args()
 
@@ -153,10 +167,10 @@ def main() -> None:
 
     proxies = read_proxies(args.input_file)
     if not proxies:
-        logging.warning("No proxies to validate.")
+        logging.warning("No proxies found to validate.")
         return
 
-    logging.info(f"Starting validation with {args.max_workers} threads, testing {len(proxies)} proxies")
+    logging.info(f"Starting validation with {args.max_workers} threads for {len(proxies)} proxies")
 
     start = time.time()
     try:
@@ -165,13 +179,16 @@ def main() -> None:
         )
 
         if args.also_test_https and valid_proxies:
-            logging.info("Re-testing with HTTPS URL...")
+            logging.info("Re-testing valid proxies with HTTPS URL...")
             valid_proxies = validate_proxies_concurrently(
                 valid_proxies, DEFAULT_TEST_URL_HTTPS, args.timeout, args.max_workers, True
             )
 
     except KeyboardInterrupt:
         logging.warning("Validation interrupted by user.")
+        valid_proxies = []
+    except Exception as e:
+        logging.error(f"Validation failed: {e}")
         valid_proxies = []
 
     duration = time.time() - start
