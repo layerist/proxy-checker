@@ -22,7 +22,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import local
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 import urllib3
@@ -46,7 +46,22 @@ USER_AGENTS = (
     "Mozilla/5.0 (X11; Linux x86_64)",
 )
 
-PROXY_RE = re.compile(r"^(?P<ip>\S+):(?P<port>\d+)(?::(?P<user>[^:]+):(?P<pwd>[^:]+))?$")
+PROXY_RE = re.compile(
+    r"""
+    ^
+    (?P<host>[^:\s]+)
+    :
+    (?P<port>\d{2,5})
+    (?:
+        :
+        (?P<user>[^:]+)
+        :
+        (?P<pwd>[^:]+)
+    )?
+    $
+    """,
+    re.VERBOSE,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -62,7 +77,7 @@ _tls = local()
 # ============================================================
 
 def read_proxies(path: Path) -> List[str]:
-    if not path.exists():
+    if not path.is_file():
         logging.error("Input file not found: %s", path)
         return []
 
@@ -72,20 +87,20 @@ def read_proxies(path: Path) -> List[str]:
         if line.strip()
     }
 
-    proxies = list(proxies)
-    random.shuffle(proxies)
+    result = list(proxies)
+    random.shuffle(result)
 
-    logging.info("Loaded %d unique proxies", len(proxies))
-    return proxies
+    logging.info("Loaded %d unique proxies", len(result))
+    return result
 
 
-def write_proxies(path: Path, proxies: List[str]) -> None:
+def write_proxies(path: Path, proxies: Iterable[str]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(proxies), encoding="utf-8")
-        logging.info("Saved %d proxies to %s", len(proxies), path)
-    except Exception as e:
-        logging.error("Failed to write output file: %s", e)
+        logging.info("Saved %d proxies to %s", len(list(proxies)), path)
+    except Exception as exc:
+        logging.error("Failed to write output file: %s", exc)
 
 
 # ============================================================
@@ -98,13 +113,10 @@ def parse_proxy(line: str) -> Optional[Dict[str, str]]:
         return None
 
     d = match.groupdict()
-    auth = f"{d['user']}:{d['pwd']}@" if d["user"] and d["pwd"] else ""
-    proxy_url = f"http://{auth}{d['ip']}:{d['port']}"
+    auth = f"{d['user']}:{d['pwd']}@" if d.get("user") and d.get("pwd") else ""
+    base = f"http://{auth}{d['host']}:{d['port']}"
 
-    return {
-        "http": proxy_url,
-        "https": proxy_url,
-    }
+    return {"http": base, "https": base}
 
 
 def make_session() -> requests.Session:
@@ -112,6 +124,8 @@ def make_session() -> requests.Session:
 
     retry = Retry(
         total=DEFAULT_RETRIES,
+        connect=DEFAULT_RETRIES,
+        read=DEFAULT_RETRIES,
         backoff_factor=0.3,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
@@ -146,9 +160,11 @@ def classify_error(exc: Exception) -> str:
         return "timeout"
     if isinstance(exc, requests.exceptions.ProxyError):
         return "proxy_error"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "ssl_error"
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "connection_error"
-    return exc.__class__.__name__
+    return type(exc).__name__
 
 
 # ============================================================
@@ -161,12 +177,13 @@ def check_proxy(
     timeout: int,
     https_only: bool,
 ) -> Tuple[Optional[str], str]:
+
     proxies = parse_proxy(proxy_line)
     if not proxies:
         return None, "invalid_format"
 
     if https_only:
-        proxies["http"] = None
+        proxies = {"https": proxies["https"]}
 
     session = get_session()
 
@@ -204,14 +221,14 @@ def validate_all(
     errors: Counter = Counter()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = (
-            executor.submit(check_proxy, p, url, timeout, https_only)
+        futures = {
+            executor.submit(check_proxy, p, url, timeout, https_only): p
             for p in proxies
-        )
+        }
 
         for future in tqdm(
             as_completed(futures),
-            total=len(proxies),
+            total=len(futures),
             desc="Checking",
             ncols=90,
         ):
@@ -222,7 +239,7 @@ def validate_all(
                 else:
                     errors[status] += 1
             except Exception as exc:
-                errors[exc.__class__.__name__] += 1
+                errors[type(exc).__name__] += 1
 
     return valid, errors
 
@@ -239,6 +256,8 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--https-only", action="store_true")
     parser.add_argument("--also-test-https", action="store_true")
+    parser.add_argument("--http-url", default=DEFAULT_HTTP_URL)
+    parser.add_argument("--https-url", default=DEFAULT_HTTPS_URL)
 
     args = parser.parse_args()
 
@@ -252,7 +271,7 @@ def main() -> None:
     try:
         valid, errors = validate_all(
             proxies,
-            DEFAULT_HTTP_URL,
+            args.http_url,
             args.timeout,
             args.max_workers,
             args.https_only,
@@ -260,17 +279,18 @@ def main() -> None:
 
         if args.also_test_https and valid:
             logging.info("Re-testing %d proxies with HTTPS", len(valid))
-            valid, _ = validate_all(
+            valid, https_errors = validate_all(
                 valid,
-                DEFAULT_HTTPS_URL,
+                args.https_url,
                 args.timeout,
                 args.max_workers,
                 https_only=True,
             )
+            errors.update(https_errors)
 
     except KeyboardInterrupt:
         logging.warning("Interrupted — saving partial results")
-        write_proxies(args.output_file, valid if "valid" in locals() else [])
+        write_proxies(args.output_file, valid)
         return
 
     duration = time.time() - start
@@ -287,7 +307,7 @@ def main() -> None:
     if errors:
         logging.info(
             "Errors: %s",
-            ", ".join(f"{k}:{v}" for k, v in errors.items()),
+            ", ".join(f"{k}:{v}" for k, v in errors.most_common()),
         )
 
 
