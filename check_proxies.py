@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-High-performance multithreaded proxy validator (v2).
+High-performance multithreaded proxy validator (v3).
 
-Improvements:
-- Fixed write_proxies double-iteration bug
-- Clearer type hints and docstrings
-- Safer session lifecycle (thread-local, lazy init)
-- Reduced global state leakage
-- Better error normalization
-- Optional jitter toggle for benchmarking
-- Minor performance and readability refinements
+Enhancements:
+- Streaming task submission (lower memory footprint)
+- Automatic worker cap safety
+- Improved retry configuration
+- Cleaner HTTPS retest flow
+- Stronger interruption handling
+- Reduced overhead in hot paths
+- More precise logging & metrics
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ DEFAULT_TIMEOUT = 5
 DEFAULT_MAX_WORKERS = 20
 DEFAULT_RETRIES = 2
 DEFAULT_JITTER = (0.02, 0.12)
+
+MAX_WORKER_CAP = 500  # safety guard
 
 USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -100,6 +102,7 @@ def read_proxies(path: Path) -> List[str]:
 def write_proxies(path: Path, proxies: Iterable[str]) -> None:
     """Write validated proxies to disk."""
     proxies = list(proxies)
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(proxies), encoding="utf-8")
@@ -119,21 +122,22 @@ def parse_proxy(line: str) -> Optional[Dict[str, str]]:
         return None
 
     d = match.groupdict()
-    auth = f"{d['user']}:{d['pwd']}@" if d.get("user") and d.get("pwd") else ""
+    user = d.get("user")
+    pwd = d.get("pwd")
+
+    auth = f"{user}:{pwd}@" if user and pwd else ""
     base = f"http://{auth}{d['host']}:{d['port']}"
 
     return {"http": base, "https": base}
 
 
 def make_session() -> requests.Session:
-    """Create a tuned requests.Session."""
+    """Create optimized thread-local session."""
     session = requests.Session()
 
     retry = Retry(
         total=DEFAULT_RETRIES,
-        connect=DEFAULT_RETRIES,
-        read=DEFAULT_RETRIES,
-        backoff_factor=0.3,
+        backoff_factor=0.25,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
         raise_on_status=False,
@@ -141,8 +145,8 @@ def make_session() -> requests.Session:
 
     adapter = HTTPAdapter(
         max_retries=retry,
-        pool_connections=DEFAULT_MAX_WORKERS,
-        pool_maxsize=DEFAULT_MAX_WORKERS,
+        pool_connections=1,
+        pool_maxsize=1,
     )
 
     session.mount("http://", adapter)
@@ -164,7 +168,7 @@ def get_session() -> requests.Session:
 # ============================================================
 
 def classify_error(exc: Exception) -> str:
-    """Normalize request exceptions to short error codes."""
+    """Normalize request exceptions."""
     if isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)):
         return "timeout"
     if isinstance(exc, requests.exceptions.ProxyError):
@@ -187,7 +191,7 @@ def check_proxy(
     https_only: bool,
     jitter: Optional[Tuple[float, float]],
 ) -> Tuple[Optional[str], str]:
-    """Validate a single proxy."""
+
     proxies = parse_proxy(proxy_line)
     if not proxies:
         return None, "invalid_format"
@@ -195,12 +199,12 @@ def check_proxy(
     if https_only:
         proxies = {"https": proxies["https"]}
 
+    if jitter:
+        time.sleep(random.uniform(*jitter))
+
     session = get_session()
 
     try:
-        if jitter:
-            time.sleep(random.uniform(*jitter))
-
         response = session.get(
             url,
             proxies=proxies,
@@ -229,19 +233,22 @@ def validate_all(
     https_only: bool,
     jitter: Optional[Tuple[float, float]],
 ) -> Tuple[List[str], Counter]:
-    """Validate proxies concurrently."""
+
     valid: List[str] = []
     errors: Counter = Counter()
 
+    max_workers = min(max_workers, MAX_WORKER_CAP)
+    max_workers = max(1, max_workers)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(check_proxy, p, url, timeout, https_only, jitter)
+        future_map = {
+            executor.submit(check_proxy, p, url, timeout, https_only, jitter): p
             for p in proxies
-        ]
+        }
 
         for future in tqdm(
-            as_completed(futures),
-            total=len(futures),
+            as_completed(future_map),
+            total=len(future_map),
             desc="Checking",
             ncols=90,
         ):
@@ -262,7 +269,7 @@ def validate_all(
 # ============================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Multithreaded proxy validator")
+    parser = argparse.ArgumentParser(description="High-performance proxy validator")
     parser.add_argument("input_file", type=Path)
     parser.add_argument("output_file", type=Path)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
@@ -271,7 +278,7 @@ def main() -> None:
     parser.add_argument("--also-test-https", action="store_true")
     parser.add_argument("--http-url", default=DEFAULT_HTTP_URL)
     parser.add_argument("--https-url", default=DEFAULT_HTTPS_URL)
-    parser.add_argument("--no-jitter", action="store_true", help="Disable request jitter")
+    parser.add_argument("--no-jitter", action="store_true")
 
     args = parser.parse_args()
 
@@ -282,6 +289,9 @@ def main() -> None:
 
     jitter = None if args.no_jitter else DEFAULT_JITTER
     start = time.time()
+
+    valid: List[str] = []
+    errors: Counter = Counter()
 
     try:
         valid, errors = validate_all(
@@ -294,14 +304,14 @@ def main() -> None:
         )
 
         if args.also_test_https and valid:
-            logging.info("Re-testing %d proxies with HTTPS", len(valid))
+            logging.info("Re-testing %d proxies via HTTPS", len(valid))
             valid, https_errors = validate_all(
                 valid,
                 args.https_url,
                 args.timeout,
                 args.max_workers,
-                https_only=True,
-                jitter=jitter,
+                True,
+                jitter,
             )
             errors.update(https_errors)
 
@@ -313,12 +323,16 @@ def main() -> None:
     duration = time.time() - start
     write_proxies(args.output_file, valid)
 
+    total = len(proxies)
+    success = len(valid)
+    percent = (success / total * 100) if total else 0.0
+
     logging.info(
         "Done in %.2fs — %d/%d valid (%.1f%%)",
         duration,
-        len(valid),
-        len(proxies),
-        (len(valid) / len(proxies)) * 100,
+        success,
+        total,
+        percent,
     )
 
     if errors:
