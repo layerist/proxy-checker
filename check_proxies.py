@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-High-performance multithreaded proxy validator (v3).
+Ultra high-performance proxy validator (v4).
 
-Enhancements:
-- Streaming task submission (lower memory footprint)
-- Automatic worker cap safety
-- Improved retry configuration
-- Cleaner HTTPS retest flow
-- Stronger interruption handling
-- Reduced overhead in hot paths
-- More precise logging & metrics
+Major upgrades:
+- Bounded task queue (no memory explosion)
+- Faster hot-path execution
+- Better connection reuse
+- Optional "fast mode" (no retries)
+- Reduced overhead per request
 """
 
 from __future__ import annotations
@@ -19,8 +17,8 @@ import logging
 import random
 import re
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 from threading import local
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -28,125 +26,89 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter, Retry
-from tqdm import tqdm
 
 # ============================================================
-#                         CONFIG
+# CONFIG
 # ============================================================
 
 DEFAULT_HTTP_URL = "http://httpbin.org/ip"
 DEFAULT_HTTPS_URL = "https://httpbin.org/ip"
 
 DEFAULT_TIMEOUT = 5
-DEFAULT_MAX_WORKERS = 20
+DEFAULT_MAX_WORKERS = 50
 DEFAULT_RETRIES = 2
-DEFAULT_JITTER = (0.02, 0.12)
 
-MAX_WORKER_CAP = 500  # safety guard
+MAX_WORKER_CAP = 1000
+MAX_PENDING_MULTIPLIER = 3  # limits queued futures
 
 USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
     "Mozilla/5.0 (X11; Linux x86_64)",
 )
 
-PROXY_RE = re.compile(
-    r"""
-    ^
-    (?P<host>[^:\s]+)
-    :
-    (?P<port>\d{2,5})
-    (?:
-        :
-        (?P<user>[^:]+)
-        :
-        (?P<pwd>[^:]+)
-    )?
-    $
-    """,
-    re.VERBOSE,
-)
+PROXY_RE = re.compile(r"^([^:\s]+):(\d{2,5})(?::([^:]+):([^:]+))?$")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 _tls = local()
 
 # ============================================================
-#                       IO HELPERS
+# IO
 # ============================================================
 
 def read_proxies(path: Path) -> List[str]:
-    """Load, deduplicate, and shuffle proxy list."""
     if not path.is_file():
-        logging.error("Input file not found: %s", path)
         return []
 
-    proxies = {
-        line.strip()
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        if line.strip()
-    }
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        proxies = list({line.strip() for line in f if line.strip()})
 
-    result = list(proxies)
-    random.shuffle(result)
-
-    logging.info("Loaded %d unique proxies", len(result))
-    return result
+    random.shuffle(proxies)
+    logging.info("Loaded %d proxies", len(proxies))
+    return proxies
 
 
 def write_proxies(path: Path, proxies: Iterable[str]) -> None:
-    """Write validated proxies to disk."""
-    proxies = list(proxies)
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(proxies), encoding="utf-8")
-        logging.info("Saved %d proxies to %s", len(proxies), path)
-    except Exception as exc:
-        logging.error("Failed to write output file: %s", exc)
+    data = "\n".join(proxies)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(data, encoding="utf-8")
+    logging.info("Saved %d proxies", len(proxies))
 
 
 # ============================================================
-#                       PROXY UTILS
+# PROXY
 # ============================================================
 
-def parse_proxy(line: str) -> Optional[Dict[str, str]]:
-    """Parse proxy in ip:port[:user:pass] format."""
-    match = PROXY_RE.match(line)
-    if not match:
+def parse_proxy(line: str) -> Optional[str]:
+    m = PROXY_RE.match(line)
+    if not m:
         return None
 
-    d = match.groupdict()
-    user = d.get("user")
-    pwd = d.get("pwd")
-
-    auth = f"{user}:{pwd}@" if user and pwd else ""
-    base = f"http://{auth}{d['host']}:{d['port']}"
-
-    return {"http": base, "https": base}
+    host, port, user, pwd = m.groups()
+    if user and pwd:
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return f"http://{host}:{port}"
 
 
-def make_session() -> requests.Session:
-    """Create optimized thread-local session."""
+def make_session(fast_mode: bool) -> requests.Session:
     session = requests.Session()
 
-    retry = Retry(
-        total=DEFAULT_RETRIES,
-        backoff_factor=0.25,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
+    if fast_mode:
+        retry = Retry(total=0)
+    else:
+        retry = Retry(
+            total=DEFAULT_RETRIES,
+            backoff_factor=0.2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
 
     adapter = HTTPAdapter(
         max_retries=retry,
-        pool_connections=1,
-        pool_maxsize=1,
+        pool_connections=10,
+        pool_maxsize=10,
     )
 
     session.mount("http://", adapter)
@@ -156,73 +118,46 @@ def make_session() -> requests.Session:
     return session
 
 
-def get_session() -> requests.Session:
-    """Thread-local session accessor."""
+def get_session(fast_mode: bool) -> requests.Session:
     if not hasattr(_tls, "session"):
-        _tls.session = make_session()
+        _tls.session = make_session(fast_mode)
     return _tls.session
 
 
 # ============================================================
-#                       ERROR CLASSIFICATION
-# ============================================================
-
-def classify_error(exc: Exception) -> str:
-    """Normalize request exceptions."""
-    if isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)):
-        return "timeout"
-    if isinstance(exc, requests.exceptions.ProxyError):
-        return "proxy_error"
-    if isinstance(exc, requests.exceptions.SSLError):
-        return "ssl_error"
-    if isinstance(exc, requests.exceptions.ConnectionError):
-        return "connection_error"
-    return type(exc).__name__
-
-
-# ============================================================
-#                       PROXY CHECK
+# CHECK
 # ============================================================
 
 def check_proxy(
     proxy_line: str,
+    parsed: str,
     url: str,
     timeout: int,
     https_only: bool,
-    jitter: Optional[Tuple[float, float]],
+    fast_mode: bool,
 ) -> Tuple[Optional[str], str]:
 
-    proxies = parse_proxy(proxy_line)
-    if not proxies:
-        return None, "invalid_format"
+    session = get_session(fast_mode)
 
-    if https_only:
-        proxies = {"https": proxies["https"]}
-
-    if jitter:
-        time.sleep(random.uniform(*jitter))
-
-    session = get_session()
+    proxies = {"https": parsed} if https_only else {"http": parsed, "https": parsed}
 
     try:
-        response = session.get(
-            url,
-            proxies=proxies,
-            timeout=timeout,
-            verify=False,
-        )
-
-        if response.ok:
-            return proxy_line, "ok"
-
-        return None, f"http_{response.status_code}"
-
-    except Exception as exc:
-        return None, classify_error(exc)
+        r = session.get(url, proxies=proxies, timeout=timeout, verify=False)
+        return (proxy_line, "ok") if r.ok else (None, f"http_{r.status_code}")
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except requests.exceptions.ProxyError:
+        return None, "proxy_error"
+    except requests.exceptions.SSLError:
+        return None, "ssl_error"
+    except requests.exceptions.ConnectionError:
+        return None, "connection_error"
+    except Exception as e:
+        return None, type(e).__name__
 
 
 # ============================================================
-#                    CONCURRENT VALIDATION
+# CORE ENGINE (IMPORTANT PART)
 # ============================================================
 
 def validate_all(
@@ -231,115 +166,114 @@ def validate_all(
     timeout: int,
     max_workers: int,
     https_only: bool,
-    jitter: Optional[Tuple[float, float]],
+    fast_mode: bool,
 ) -> Tuple[List[str], Counter]:
+
+    max_workers = max(1, min(max_workers, MAX_WORKER_CAP))
+    max_pending = max_workers * MAX_PENDING_MULTIPLIER
 
     valid: List[str] = []
     errors: Counter = Counter()
 
-    max_workers = min(max_workers, MAX_WORKER_CAP)
-    max_workers = max(1, max_workers)
+    parsed_cache = {p: parse_proxy(p) for p in proxies}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(check_proxy, p, url, timeout, https_only, jitter): p
-            for p in proxies
-        }
+        futures = set()
+        it = iter(proxies)
 
-        for future in tqdm(
-            as_completed(future_map),
-            total=len(future_map),
-            desc="Checking",
-            ncols=90,
-        ):
+        # preload
+        for _ in range(min(max_pending, len(proxies))):
             try:
-                proxy, status = future.result()
-                if proxy:
-                    valid.append(proxy)
-                else:
-                    errors[status] += 1
-            except Exception as exc:
-                errors[type(exc).__name__] += 1
+                p = next(it)
+                parsed = parsed_cache[p]
+                if not parsed:
+                    errors["invalid_format"] += 1
+                    continue
+                futures.add(executor.submit(check_proxy, p, parsed, url, timeout, https_only, fast_mode))
+            except StopIteration:
+                break
+
+        while futures:
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+
+            for fut in done:
+                try:
+                    proxy, status = fut.result()
+                    if proxy:
+                        valid.append(proxy)
+                    else:
+                        errors[status] += 1
+                except Exception as e:
+                    errors[type(e).__name__] += 1
+
+                # refill queue
+                try:
+                    p = next(it)
+                    parsed = parsed_cache[p]
+                    if not parsed:
+                        errors["invalid_format"] += 1
+                        continue
+                    futures.add(executor.submit(check_proxy, p, parsed, url, timeout, https_only, fast_mode))
+                except StopIteration:
+                    pass
 
     return valid, errors
 
 
 # ============================================================
-#                             MAIN
+# MAIN
 # ============================================================
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="High-performance proxy validator")
+def main():
+    parser = argparse.ArgumentParser()
     parser.add_argument("input_file", type=Path)
     parser.add_argument("output_file", type=Path)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--https-only", action="store_true")
     parser.add_argument("--also-test-https", action="store_true")
-    parser.add_argument("--http-url", default=DEFAULT_HTTP_URL)
-    parser.add_argument("--https-url", default=DEFAULT_HTTPS_URL)
-    parser.add_argument("--no-jitter", action="store_true")
+    parser.add_argument("--fast", action="store_true")
 
     args = parser.parse_args()
 
     proxies = read_proxies(args.input_file)
     if not proxies:
-        logging.warning("No proxies to validate")
         return
 
-    jitter = None if args.no_jitter else DEFAULT_JITTER
     start = time.time()
 
-    valid: List[str] = []
-    errors: Counter = Counter()
+    valid, errors = validate_all(
+        proxies,
+        DEFAULT_HTTP_URL,
+        args.timeout,
+        args.max_workers,
+        args.https_only,
+        args.fast,
+    )
 
-    try:
-        valid, errors = validate_all(
-            proxies,
-            args.http_url,
+    if args.also_test_https and valid:
+        logging.info("HTTPS re-check...")
+        valid, https_errors = validate_all(
+            valid,
+            DEFAULT_HTTPS_URL,
             args.timeout,
             args.max_workers,
-            args.https_only,
-            jitter,
+            True,
+            args.fast,
         )
+        errors.update(https_errors)
 
-        if args.also_test_https and valid:
-            logging.info("Re-testing %d proxies via HTTPS", len(valid))
-            valid, https_errors = validate_all(
-                valid,
-                args.https_url,
-                args.timeout,
-                args.max_workers,
-                True,
-                jitter,
-            )
-            errors.update(https_errors)
-
-    except KeyboardInterrupt:
-        logging.warning("Interrupted — saving partial results")
-        write_proxies(args.output_file, valid)
-        return
-
-    duration = time.time() - start
     write_proxies(args.output_file, valid)
 
-    total = len(proxies)
-    success = len(valid)
-    percent = (success / total * 100) if total else 0.0
-
     logging.info(
-        "Done in %.2fs — %d/%d valid (%.1f%%)",
-        duration,
-        success,
-        total,
-        percent,
+        "Done in %.2fs | %d/%d valid",
+        time.time() - start,
+        len(valid),
+        len(proxies),
     )
 
     if errors:
-        logging.info(
-            "Errors: %s",
-            ", ".join(f"{k}:{v}" for k, v in errors.most_common()),
-        )
+        logging.info("Errors: %s", dict(errors))
 
 
 if __name__ == "__main__":
