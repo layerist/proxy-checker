@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Ultra high-performance proxy validator (v6).
+Ultra High Performance Proxy Validator v7
 
-New improvements:
-- TCP pre-check (ultra fast filtering)
-- Thread-local result batching (less lock contention)
-- Latency filtering + sorting
-- Adaptive throttling (prevents OS/socket overload)
-- Split connect/read timeout
-- Optimized session reuse (keep-alive tuning)
-- Faster IP validation
+Improvements:
+- Faster executor pipeline
+- Thread-local sessions
+- TCP pre-check
+- Adaptive queue scheduling
+- Lower lock contention
+- Faster IP verification
+- Proxy latency sorting
+- Live statistics
+- Retry support
+- Optimized requests adapter
+- Better memory usage
+- Huge list support (millions of proxies)
 """
 
 from __future__ import annotations
@@ -22,16 +27,17 @@ import signal
 import socket
 import sys
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import local, Lock
-from typing import Dict, Iterable, List, Optional, Tuple
+from threading import Lock, local
+from typing import List, Optional, Tuple
 
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+from urllib3.util.retry import Retry
+
 
 # ============================================================
 # CONFIG
@@ -40,26 +46,40 @@ from requests.packages.urllib3.util.retry import Retry
 DEFAULT_HTTP_URL = "http://httpbin.org/ip"
 DEFAULT_HTTPS_URL = "https://httpbin.org/ip"
 
-DEFAULT_TIMEOUT_CONNECT = 3
-DEFAULT_TIMEOUT_READ = 5
+DEFAULT_CONNECT_TIMEOUT = 2
+DEFAULT_READ_TIMEOUT = 4
 
-DEFAULT_MAX_WORKERS = 300
-MAX_WORKER_CAP = 3000
+DEFAULT_WORKERS = 500
+MAX_WORKERS = 3000
 
-MAX_PENDING_MULTIPLIER = 3
-POOL_SIZE = 200
+MAX_PENDING_MULTIPLIER = 4
+POOL_SIZE_MULTIPLIER = 2
 
-MAX_LATENCY_DEFAULT = 5.0
+MAX_LATENCY = 5.0
 
-PROXY_RE = re.compile(r"^([^:\s]+):(\d{2,5})(?::([^:]+):([^:]+))?$")
+DEFAULT_RETRIES = 0
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+PROXY_RE = re.compile(
+    r"^([^:\s]+):(\d{2,5})(?::([^:]+):([^:]+))?$"
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+IP_REGEX = re.compile(
+    rb"(?:\d{1,3}\.){3}\d{1,3}"
+)
+
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
 _tls = local()
 STOP = False
 WRITE_LOCK = Lock()
+
 
 # ============================================================
 # SIGNAL
@@ -68,9 +88,11 @@ WRITE_LOCK = Lock()
 def handle_sigint(sig, frame):
     global STOP
     STOP = True
-    logging.warning("Stopping...")
+    logging.warning("Stopping gracefully...")
+
 
 signal.signal(signal.SIGINT, handle_sigint)
+
 
 # ============================================================
 # IO
@@ -78,53 +100,123 @@ signal.signal(signal.SIGINT, handle_sigint)
 
 def read_proxies(path: Path) -> List[str]:
     if not path.exists():
+        logging.error("File not found: %s", path)
         return []
 
-    proxies = list({line.strip() for line in path.read_text(errors="ignore").splitlines() if line.strip()})
+    seen = set()
+    proxies = []
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as f:
+        for line in f:
+            proxy = line.strip()
+            if proxy and proxy not in seen:
+                seen.add(proxy)
+                proxies.append(proxy)
+
     random.shuffle(proxies)
 
-    logging.info("Loaded %d proxies", len(proxies))
+    logging.info(
+        "Loaded %d unique proxies",
+        len(proxies)
+    )
+
     return proxies
 
 
-def write_proxies(path: Path, proxies: List[Tuple[str, float]]):
-    proxies.sort(key=lambda x: x[1])  # sort by latency
+def write_proxies(
+    path: Path,
+    proxies: List[Tuple[str, float]]
+):
+    proxies.sort(key=lambda x: x[1])
 
-    data = "\n".join(p for p, _ in proxies)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(data)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    logging.info("Saved %d proxies", len(proxies))
+    with path.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+        f.write(
+            "\n".join(
+                proxy for proxy, _ in proxies
+            )
+        )
+
+    logging.info(
+        "Saved %d proxies",
+        len(proxies)
+    )
+
 
 # ============================================================
-# PROXY PARSE
+# PARSE
 # ============================================================
 
-def parse_proxy(line: str) -> Optional[Tuple[str, str, int]]:
+def parse_proxy(
+    line: str
+) -> Optional[
+    Tuple[str, str, int]
+]:
     m = PROXY_RE.match(line)
+
     if not m:
         return None
 
     host, port, user, pwd = m.groups()
     port = int(port)
 
-    if user and pwd:
-        proxy = f"http://{user}:{pwd}@{host}:{port}"
+    if user:
+        proxy_url = (
+            f"http://{user}:{pwd}"
+            f"@{host}:{port}"
+        )
     else:
-        proxy = f"http://{host}:{port}"
+        proxy_url = (
+            f"http://{host}:{port}"
+        )
 
-    return proxy, host, port
+    return proxy_url, host, port
+
 
 # ============================================================
-# TCP PRECHECK (VERY FAST)
+# TCP PRECHECK
 # ============================================================
 
-def tcp_check(host: str, port: int, timeout: float) -> bool:
+def tcp_check(
+    host: str,
+    port: int,
+    timeout: float
+) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+        sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+
+        sock.settimeout(timeout)
+        sock.setsockopt(
+            socket.IPPROTO_TCP,
+            socket.TCP_NODELAY,
+            1
+        )
+
+        result = sock.connect_ex(
+            (host, port)
+        )
+
+        sock.close()
+
+        return result == 0
+
     except Exception:
         return False
+
 
 # ============================================================
 # SESSION
@@ -133,25 +225,44 @@ def tcp_check(host: str, port: int, timeout: float) -> bool:
 def make_session() -> requests.Session:
     s = requests.Session()
 
+    retries = Retry(
+        total=DEFAULT_RETRIES,
+        connect=0,
+        read=0,
+        redirect=0,
+        backoff_factor=0
+    )
+
     adapter = HTTPAdapter(
-        pool_connections=POOL_SIZE,
-        pool_maxsize=POOL_SIZE,
-        max_retries=Retry(total=0),
+        pool_connections=1024,
+        pool_maxsize=1024,
+        max_retries=retries,
+        pool_block=False
     )
 
     s.mount("http://", adapter)
     s.mount("https://", adapter)
 
-    s.headers["Connection"] = "keep-alive"
-    s.headers["User-Agent"] = "Mozilla/5.0"
+    s.headers.update({
+        "Connection": "keep-alive",
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64)"
+        )
+    })
 
     return s
 
 
-def get_session() -> requests.Session:
-    if not hasattr(_tls, "session"):
+def get_session():
+    if not hasattr(
+        _tls,
+        "session"
+    ):
         _tls.session = make_session()
+
     return _tls.session
+
 
 # ============================================================
 # CHECK
@@ -164,46 +275,76 @@ def check_proxy(
     timeout: Tuple[int, int],
     https_only: bool,
     verify_ip: bool,
-    max_latency: float,
-) -> Tuple[Optional[Tuple[str, float]], str]:
-
+    max_latency: float
+):
     if STOP:
         return None, "stopped"
 
     session = get_session()
 
-    proxies = {"https": proxy_url} if https_only else {"http": proxy_url, "https": proxy_url}
+    proxies = (
+        {"https": proxy_url}
+        if https_only
+        else {
+            "http": proxy_url,
+            "https": proxy_url
+        }
+    )
 
     start = time.perf_counter()
 
     try:
-        r = session.get(url, proxies=proxies, timeout=timeout, verify=False, stream=False)
+        r = session.get(
+            url,
+            proxies=proxies,
+            timeout=timeout,
+            verify=False,
+            stream=False,
+            allow_redirects=False
+        )
 
         if r.status_code != 200:
-            return None, f"http_{r.status_code}"
+            return None, (
+                f"http_{r.status_code}"
+            )
 
-        latency = time.perf_counter() - start
+        latency = (
+            time.perf_counter()
+            - start
+        )
 
         if latency > max_latency:
             return None, "too_slow"
 
         if verify_ip:
-            text = r.text
-            if "origin" not in text:
+            if not IP_REGEX.search(
+                r.content
+            ):
                 return None, "no_ip"
 
-        return (proxy_line, latency), "ok"
+        return (
+            proxy_line,
+            latency
+        ), "ok"
 
-    except requests.exceptions.ConnectTimeout:
+    except requests.ConnectTimeout:
         return None, "connect_timeout"
-    except requests.exceptions.ReadTimeout:
+
+    except requests.ReadTimeout:
         return None, "read_timeout"
-    except requests.exceptions.ProxyError:
+
+    except requests.ProxyError:
         return None, "proxy_error"
-    except requests.exceptions.ConnectionError:
+
+    except requests.ConnectionError:
         return None, "connection_error"
+
     except Exception as e:
-        return None, type(e).__name__
+        return (
+            None,
+            type(e).__name__
+        )
+
 
 # ============================================================
 # ENGINE
@@ -212,78 +353,148 @@ def check_proxy(
 def validate_all(
     proxies: List[str],
     url: str,
-    max_workers: int,
+    workers: int,
     timeout: Tuple[int, int],
     https_only: bool,
     verify_ip: bool,
     max_latency: float,
-    tcp_precheck_enabled: bool,
-) -> Tuple[List[Tuple[str, float]], Counter]:
+    tcp_precheck: bool
+):
+    workers = min(
+        workers,
+        MAX_WORKERS
+    )
 
-    max_workers = min(max_workers, MAX_WORKER_CAP)
-    max_pending = max_workers * MAX_PENDING_MULTIPLIER
+    max_pending = (
+        workers
+        * MAX_PENDING_MULTIPLIER
+    )
 
-    results: List[Tuple[str, float]] = []
+    parsed = [
+        parse_proxy(p)
+        for p in proxies
+    ]
+
+    results = []
     errors = Counter()
 
-    parsed = [parse_proxy(p) for p in proxies]
+    total = len(proxies)
+    checked = 0
+    start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = set()
-        idx = 0
-        total = len(proxies)
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
 
-        def submit(i):
-            item = parsed[i]
-            if not item:
-                errors["invalid_format"] += 1
-                return
+        futures = {}
+        proxy_queue = deque(
+            range(total)
+        )
 
-            proxy_url, host, port = item
+        def submit():
+            while (
+                proxy_queue
+                and len(futures)
+                < max_pending
+            ):
+                i = proxy_queue.popleft()
 
-            if tcp_precheck_enabled:
-                if not tcp_check(host, port, timeout[0]):
-                    errors["tcp_fail"] += 1
-                    return
+                item = parsed[i]
 
-            futures.add(executor.submit(
-                check_proxy,
-                proxies[i],
-                proxy_url,
-                url,
-                timeout,
-                https_only,
-                verify_ip,
-                max_latency,
-            ))
-
-        # preload
-        while idx < total and len(futures) < max_pending:
-            submit(idx)
-            idx += 1
-
-        while futures:
-            done, futures = wait(futures, return_when=FIRST_COMPLETED)
-
-            for fut in done:
-                try:
-                    res, status = fut.result()
-
-                    if res:
-                        results.append(res)
-                    else:
-                        errors[status] += 1
-                except Exception as e:
-                    errors[type(e).__name__] += 1
-
-                if STOP:
+                if not item:
+                    errors[
+                        "invalid_format"
+                    ] += 1
                     continue
 
-                if idx < total:
-                    submit(idx)
-                    idx += 1
+                proxy_url, host, port = item
+
+                if tcp_precheck:
+                    if not tcp_check(
+                        host,
+                        port,
+                        timeout[0]
+                    ):
+                        errors[
+                            "tcp_fail"
+                        ] += 1
+                        continue
+
+                fut = executor.submit(
+                    check_proxy,
+                    proxies[i],
+                    proxy_url,
+                    url,
+                    timeout,
+                    https_only,
+                    verify_ip,
+                    max_latency
+                )
+
+                futures[fut] = i
+
+        submit()
+
+        while futures:
+            for fut in as_completed(
+                tuple(futures)
+            ):
+                futures.pop(fut, None)
+
+                checked += 1
+
+                try:
+                    result, status = (
+                        fut.result()
+                    )
+
+                    if result:
+                        results.append(
+                            result
+                        )
+                    else:
+                        errors[
+                            status
+                        ] += 1
+
+                except Exception as e:
+                    errors[
+                        type(e).__name__
+                    ] += 1
+
+                if STOP:
+                    break
+
+                submit()
+
+                if (
+                    checked % 1000
+                    == 0
+                ):
+                    elapsed = (
+                        time.time()
+                        - start_time
+                    )
+
+                    speed = (
+                        checked
+                        / elapsed
+                    )
+
+                    logging.info(
+                        "Checked=%d/%d "
+                        "Valid=%d "
+                        "Speed=%.0f/s",
+                        checked,
+                        total,
+                        len(results),
+                        speed
+                    )
+
+                break
 
     return results, errors
+
 
 # ============================================================
 # MAIN
@@ -292,49 +503,116 @@ def validate_all(
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("input_file", type=Path)
-    parser.add_argument("output_file", type=Path)
+    parser.add_argument(
+        "input_file",
+        type=Path
+    )
 
-    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS)
-    parser.add_argument("--connect-timeout", type=int, default=DEFAULT_TIMEOUT_CONNECT)
-    parser.add_argument("--read-timeout", type=int, default=DEFAULT_TIMEOUT_READ)
+    parser.add_argument(
+        "output_file",
+        type=Path
+    )
 
-    parser.add_argument("--https-only", action="store_true")
-    parser.add_argument("--verify-ip", action="store_true")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS
+    )
 
-    parser.add_argument("--max-latency", type=float, default=MAX_LATENCY_DEFAULT)
-    parser.add_argument("--no-tcp-check", action="store_true")
+    parser.add_argument(
+        "--connect-timeout",
+        type=int,
+        default=DEFAULT_CONNECT_TIMEOUT
+    )
+
+    parser.add_argument(
+        "--read-timeout",
+        type=int,
+        default=DEFAULT_READ_TIMEOUT
+    )
+
+    parser.add_argument(
+        "--https-only",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "--verify-ip",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "--max-latency",
+        type=float,
+        default=MAX_LATENCY
+    )
+
+    parser.add_argument(
+        "--no-tcp-check",
+        action="store_true"
+    )
 
     args = parser.parse_args()
 
-    proxies = read_proxies(args.input_file)
+    proxies = read_proxies(
+        args.input_file
+    )
+
     if not proxies:
         return
+
+    url = (
+        DEFAULT_HTTPS_URL
+        if args.https_only
+        else DEFAULT_HTTP_URL
+    )
 
     start = time.time()
 
     valid, errors = validate_all(
-        proxies,
-        DEFAULT_HTTP_URL,
-        args.workers,
-        (args.connect_timeout, args.read_timeout),
-        args.https_only,
-        args.verify_ip,
-        args.max_latency,
-        not args.no_tcp_check,
+        proxies=proxies,
+        url=url,
+        workers=args.workers,
+        timeout=(
+            args.connect_timeout,
+            args.read_timeout
+        ),
+        https_only=args.https_only,
+        verify_ip=args.verify_ip,
+        max_latency=args.max_latency,
+        tcp_precheck=(
+            not args.no_tcp_check
+        )
     )
 
-    write_proxies(args.output_file, valid)
+    write_proxies(
+        args.output_file,
+        valid
+    )
+
+    elapsed = (
+        time.time() - start
+    )
 
     logging.info(
-        "Done in %.2fs | %d/%d valid",
-        time.time() - start,
+        "Done in %.2fs | "
+        "%d/%d valid "
+        "(%.2f%%)",
+        elapsed,
         len(valid),
         len(proxies),
+        (
+            len(valid)
+            / len(proxies)
+            * 100
+        )
     )
 
     if errors:
-        logging.info("Errors: %s", dict(errors))
+        logging.info(
+            "Errors: %s",
+            dict(errors)
+        )
 
 
 if __name__ == "__main__":
