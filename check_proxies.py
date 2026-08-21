@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Proxy Validator v10
+Proxy Validator v11
 
 A robust validator for large HTTP, HTTPS-to-proxy, SOCKS4, SOCKS5 and
 SOCKS5h proxy lists.
@@ -39,7 +39,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, local
+from threading import Event
 from typing import BinaryIO, Iterable, Iterator, Sequence, TextIO
 from urllib.parse import quote, unquote, urlsplit
 
@@ -47,7 +47,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 
-VERSION = "10.0"
+VERSION = "11.0"
 DEFAULT_TEST_URLS = (
     "https://api.ipify.org?format=json",
     "https://icanhazip.com/",
@@ -56,7 +56,6 @@ DEFAULT_TEST_URLS = (
 SUPPORTED_PROTOCOLS = ("http", "https", "socks5", "socks5h", "socks4")
 SOCKS_PROTOCOLS = frozenset({"socks4", "socks5", "socks5h"})
 MAX_RESPONSE_BYTES = 64 * 1024
-TLS = local()
 STOP_EVENT = Event()
 BRACKETED_AUTH_RE = re.compile(
     r"^\[(?P<host>[^\]]+)]:(?P<port>\d+):(?P<user>[^:]*):(?P<password>.*)$"
@@ -79,8 +78,10 @@ class CheckResult:
     status: str
     protocol: str | None = None
     latency: float | None = None
+    ttfb: float | None = None
     exit_ip: str | None = None
     endpoint: str | None = None
+    canonical_url: str | None = None
     error: str | None = None
     attempts: int = 0
 
@@ -196,7 +197,7 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
             raw,
             host,
             port,
-            username or None,
+            username,
             password,
             tuple(default_protocols),
         )
@@ -207,7 +208,7 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
             raw,
             validate_host(bracketed.group("host")),
             validate_port(bracketed.group("port")),
-            bracketed.group("user") or None,
+            bracketed.group("user"),
             bracketed.group("password"),
             tuple(default_protocols),
         )
@@ -222,7 +223,7 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
                 raw,
                 validate_host(host),
                 validate_port(port_text),
-                parts[2] or None,
+                parts[2],
                 ":".join(parts[3:]),
                 tuple(default_protocols),
             )
@@ -240,17 +241,21 @@ def canonical_proxy_url(candidate: ProxyCandidate, protocol: str) -> str:
     return f"{protocol}://{auth}{format_host_for_url(candidate.host)}:{candidate.port}"
 
 
-def output_proxy_value(result: CheckResult, candidate: ProxyCandidate, mode: str) -> str:
-    if mode == "original" or result.protocol is None:
+def output_proxy_value(result: CheckResult, mode: str) -> str:
+    if mode == "original" or not result.canonical_url:
         return result.proxy
-    return canonical_proxy_url(candidate, result.protocol)
+    return result.canonical_url
 
 
-def get_session(pool_size: int, user_agent: str) -> requests.Session:
-    session = getattr(TLS, "session", None)
-    if session is not None:
-        return session
+def create_session(user_agent: str) -> requests.Session:
+    """Create a session scoped to one proxy candidate.
 
+    requests/urllib3 caches a ProxyManager for every distinct proxy URL inside
+    an HTTPAdapter. Reusing one thread-local Session across a huge proxy list
+    therefore makes memory usage grow with the number of tested proxies. A
+    per-candidate Session keeps connection reuse for retries/endpoints while
+    bounding that cache to only this candidate's protocol variants.
+    """
     session = requests.Session()
     session.trust_env = False
     session.headers.update(
@@ -261,14 +266,13 @@ def get_session(pool_size: int, user_agent: str) -> requests.Session:
         }
     )
     adapter = HTTPAdapter(
-        pool_connections=max(8, pool_size),
-        pool_maxsize=max(8, pool_size),
+        pool_connections=4,
+        pool_maxsize=4,
         max_retries=0,
         pool_block=False,
     )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    TLS.session = session
     return session
 
 
@@ -284,20 +288,30 @@ def tcp_check(host: str, port: int, timeout: float) -> tuple[bool, str | None]:
         return False, f"tcp:{exc.__class__.__name__}"
 
 
-def read_limited_response(response: requests.Response, limit: int) -> bytes:
+def read_limited_response(
+    response: requests.Response,
+    limit: int,
+    *,
+    deadline: float | None = None,
+) -> tuple[bytes, bool]:
     chunks: list[bytes] = []
     size = 0
+    deadline_exceeded = False
     for chunk in response.iter_content(chunk_size=4096):
+        if deadline is not None and time.perf_counter() > deadline:
+            deadline_exceeded = True
+            break
         if not chunk:
             continue
         remaining = limit - size
         if remaining <= 0:
             break
-        chunks.append(chunk[:remaining])
-        size += min(len(chunk), remaining)
+        piece = chunk[:remaining]
+        chunks.append(piece)
+        size += len(piece)
         if size >= limit:
             break
-    return b"".join(chunks)
+    return b"".join(chunks), deadline_exceeded
 
 
 def extract_ip(payload_bytes: bytes) -> str | None:
@@ -363,10 +377,10 @@ def check_proxy(
     retries: int,
     retry_backoff: float,
     max_latency: float,
+    max_attempts: int,
     use_tcp_check: bool,
     verify_tls: bool,
     require_ip: bool,
-    pool_size: int,
     user_agent: str,
 ) -> CheckResult:
     if STOP_EVENT.is_set():
@@ -383,7 +397,7 @@ def check_proxy(
             return CheckResult(raw_proxy, "tcp_fail", error=tcp_error)
 
     try:
-        session = get_session(pool_size, user_agent)
+        session = create_session(user_agent)
     except Exception as exc:
         return CheckResult(
             raw_proxy,
@@ -394,74 +408,119 @@ def check_proxy(
     last_status = "dead"
     last_error: str | None = None
     attempts = 0
+    # A local RNG avoids contention on the module-level random generator when
+    # hundreds of worker threads finish/start requests at the same time.
+    rng = random.Random(os.urandom(16))
 
-    for protocol in candidate.protocols:
-        if STOP_EVENT.is_set():
-            return CheckResult(raw_proxy, "cancelled", attempts=attempts)
+    try:
+        for protocol in candidate.protocols:
+            if STOP_EVENT.is_set():
+                return CheckResult(raw_proxy, "cancelled", attempts=attempts)
 
-        proxy_url = canonical_proxy_url(candidate, protocol)
-        proxies = {"http": proxy_url, "https": proxy_url}
+            proxy_url = canonical_proxy_url(candidate, protocol)
+            proxies = {"http": proxy_url, "https": proxy_url}
 
-        for retry_index in range(retries + 1):
-            endpoints = list(test_urls)
-            if len(endpoints) > 1:
-                random.shuffle(endpoints)
+            for retry_index in range(retries + 1):
+                endpoints = list(test_urls)
+                if len(endpoints) > 1:
+                    rng.shuffle(endpoints)
 
-            for endpoint in endpoints:
-                if STOP_EVENT.is_set():
-                    return CheckResult(raw_proxy, "cancelled", attempts=attempts)
-
-                attempts += 1
-                started = time.perf_counter()
-                try:
-                    with session.get(
-                        endpoint,
-                        proxies=proxies,
-                        timeout=(connect_timeout, read_timeout),
-                        verify=verify_tls,
-                        allow_redirects=True,
-                        stream=True,
-                    ) as response:
-                        latency = time.perf_counter() - started
-                        if response.status_code != 200:
-                            last_status = f"http_{response.status_code}"
-                            last_error = f"endpoint returned HTTP {response.status_code}"
-                            continue
-                        if latency > max_latency:
-                            last_status = "too_slow"
-                            last_error = f"{latency:.3f}s > {max_latency:.3f}s"
-                            continue
-
-                        body = read_limited_response(response, MAX_RESPONSE_BYTES)
-                        exit_ip = extract_ip(body)
-                        if require_ip and exit_ip is None:
-                            last_status = "invalid_response"
-                            last_error = "HTTP 200 received but no valid IP was found"
-                            continue
-
+                for endpoint in endpoints:
+                    if STOP_EVENT.is_set():
+                        return CheckResult(raw_proxy, "cancelled", attempts=attempts)
+                    if max_attempts and attempts >= max_attempts:
                         return CheckResult(
-                            proxy=raw_proxy,
-                            status="ok",
-                            protocol=protocol,
-                            latency=latency,
-                            exit_ip=exit_ip,
-                            endpoint=endpoint,
+                            raw_proxy,
+                            last_status,
+                            error=last_error or "maximum attempts reached",
                             attempts=attempts,
                         )
-                except requests.RequestException as exc:
-                    last_status = classify_request_error(exc)
-                    last_error = compact_error(exc)
-                except Exception as exc:
-                    last_status = "unexpected_error"
-                    last_error = f"{exc.__class__.__name__}: {compact_error(exc)}"
 
-            if retry_index < retries:
-                delay = retry_backoff * (2**retry_index)
-                delay += random.uniform(0.0, max(0.001, delay * 0.25))
-                if STOP_EVENT.wait(delay):
-                    return CheckResult(raw_proxy, "cancelled", attempts=attempts)
+                    attempts += 1
+                    started = time.perf_counter()
+                    try:
+                        with session.get(
+                            endpoint,
+                            proxies=proxies,
+                            timeout=(connect_timeout, read_timeout),
+                            verify=verify_tls,
+                            allow_redirects=True,
+                            stream=True,
+                        ) as response:
+                            headers_received = time.perf_counter()
+                            ttfb = headers_received - started
 
-    return CheckResult(raw_proxy, last_status, error=last_error, attempts=attempts)
+                            if response.status_code != 200:
+                                if response.status_code == 407:
+                                    last_status = "proxy_auth_required"
+                                else:
+                                    last_status = f"http_{response.status_code}"
+                                last_error = (
+                                    f"endpoint returned HTTP {response.status_code}"
+                                )
+                                continue
+
+                            # If even TTFB already exceeded the limit there is no
+                            # reason to spend more time reading the body.
+                            if ttfb > max_latency:
+                                last_status = "too_slow"
+                                last_error = f"TTFB {ttfb:.3f}s > {max_latency:.3f}s"
+                                continue
+
+                            body, deadline_exceeded = read_limited_response(
+                                response,
+                                MAX_RESPONSE_BYTES,
+                                deadline=started + max_latency,
+                            )
+                            latency = time.perf_counter() - started
+                            if deadline_exceeded or latency > max_latency:
+                                last_status = "too_slow"
+                                last_error = (
+                                    f"total {latency:.3f}s > {max_latency:.3f}s"
+                                )
+                                continue
+
+                            exit_ip = extract_ip(body)
+                            if require_ip and exit_ip is None:
+                                last_status = "invalid_response"
+                                last_error = (
+                                    "HTTP 200 received but no valid IP was found"
+                                )
+                                continue
+
+                            return CheckResult(
+                                proxy=raw_proxy,
+                                status="ok",
+                                protocol=protocol,
+                                latency=latency,
+                                ttfb=ttfb,
+                                exit_ip=exit_ip,
+                                endpoint=endpoint,
+                                canonical_url=proxy_url,
+                                attempts=attempts,
+                            )
+                    except requests.RequestException as exc:
+                        last_status = classify_request_error(exc)
+                        last_error = compact_error(exc)
+                    except Exception as exc:
+                        last_status = "unexpected_error"
+                        last_error = (
+                            f"{exc.__class__.__name__}: {compact_error(exc)}"
+                        )
+
+                if retry_index < retries:
+                    delay = retry_backoff * (2**retry_index)
+                    delay += rng.uniform(0.0, max(0.001, delay * 0.25))
+                    if STOP_EVENT.wait(delay):
+                        return CheckResult(
+                            raw_proxy, "cancelled", attempts=attempts
+                        )
+    finally:
+        session.close()
+
+    return CheckResult(
+        raw_proxy, last_status, error=last_error, attempts=attempts
+    )
 
 
 def iter_input_lines(path: Path) -> Iterator[str]:
@@ -586,6 +645,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--read-timeout", type=positive_float, default=5.0)
     parser.add_argument("--tcp-timeout", type=positive_float, default=1.5)
     parser.add_argument("--retries", type=non_negative_int, default=1)
+    parser.add_argument(
+        "--max-attempts",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "maximum HTTP attempts per proxy across protocols/endpoints/retries; "
+            "0 means unlimited"
+        ),
+    )
     parser.add_argument("--retry-backoff", type=positive_float, default=0.15)
     parser.add_argument("--max-latency", type=positive_float, default=8.0)
 
@@ -648,11 +716,13 @@ def tsv_cell(value: object | None) -> str:
 
 def write_detail(handle: TextIO, result: CheckResult) -> None:
     latency_ms = "" if result.latency is None else f"{result.latency * 1000:.1f}"
+    ttfb_ms = "" if result.ttfb is None else f"{result.ttfb * 1000:.1f}"
     fields = (
         result.proxy,
         result.status,
         result.protocol,
         latency_ms,
+        ttfb_ms,
         result.exit_ip,
         result.endpoint,
         result.attempts,
@@ -696,8 +766,7 @@ def process_result(
         valid_results.append(result)
         return
 
-    candidate = parse_proxy_line(result.proxy, args.protocols)
-    output.write(output_proxy_value(result, candidate, args.output_format) + "\n")
+    output.write(output_proxy_value(result, args.output_format) + "\n")
 
 
 def run_checks(
@@ -716,6 +785,7 @@ def run_checks(
     futures: dict[Future[CheckResult], str] = {}
     source_iter = iter(source)
     completed_since_flush = 0
+    next_progress = args.progress_every
 
     check_kwargs = dict(
         protocols=args.protocols,
@@ -726,10 +796,10 @@ def run_checks(
         retries=args.retries,
         retry_backoff=args.retry_backoff,
         max_latency=args.max_latency,
+        max_attempts=args.max_attempts,
         use_tcp_check=not args.no_tcp_check,
         verify_tls=not args.insecure,
         require_ip=not args.no_require_ip,
-        pool_size=max(8, min(64, args.workers)),
         user_agent=args.user_agent,
     )
 
@@ -795,8 +865,10 @@ def run_checks(
                     details.flush()
                 completed_since_flush = 0
 
-            if state.checked % args.progress_every == 0 or state.checked == total:
+            if state.checked >= next_progress or state.checked == total:
                 print_progress(state, total, len(futures), started)
+                while next_progress <= state.checked:
+                    next_progress += args.progress_every
 
             if state.interrupted and not futures:
                 break
@@ -843,7 +915,7 @@ def main() -> int:
         if args.details:
             args.details.parent.mkdir(parents=True, exist_ok=True)
             args.details.write_text(
-                "proxy\tstatus\tprotocol\tlatency_ms\texit_ip\tendpoint\tattempts\terror\n",
+                "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\texit_ip\tendpoint\tattempts\terror\n",
                 encoding="utf-8",
             )
         source_path.unlink(missing_ok=True)
@@ -888,7 +960,7 @@ def main() -> int:
             try:
                 if details_handle is not None:
                     details_handle.write(
-                        "proxy\tstatus\tprotocol\tlatency_ms\texit_ip\tendpoint\tattempts\terror\n"
+                        "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\texit_ip\tendpoint\tattempts\terror\n"
                     )
 
                 state, stats, valid_results = run_checks(
@@ -905,9 +977,8 @@ def main() -> int:
                         key=lambda item: item.latency if item.latency is not None else float("inf")
                     )
                     for result in valid_results:
-                        candidate = parse_proxy_line(result.proxy, args.protocols)
                         output.write(
-                            output_proxy_value(result, candidate, args.output_format) + "\n"
+                            output_proxy_value(result, args.output_format) + "\n"
                         )
 
                 output.flush()
