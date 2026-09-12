@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 """
-Proxy Validator v11
+Proxy Validator v12
 
-A robust validator for large HTTP, HTTPS-to-proxy, SOCKS4, SOCKS5 and
-SOCKS5h proxy lists.
+Robust, bounded-concurrency validator for large HTTP, HTTPS-to-proxy,
+SOCKS4, SOCKS5 and SOCKS5h proxy lists.
+
+Highlights:
+- Correct URL defaults and strict endpoint validation.
+- Explicit-scheme proxies are tested only with that scheme.
+- Bounded in-flight futures and graceful interruption.
+- Per-candidate requests.Session prevents unbounded ProxyManager growth.
+- Deterministic failures such as HTTP 407 do not waste retries.
+- Optional hard cap on HTTP attempts per proxy.
+- Memory or SQLite-backed input deduplication.
+- Atomic, optionally durable output replacement.
+- Optional TSV diagnostics with credential redaction.
+- More defensive proxy parsing, IPv6 handling and error classification.
+- Streaming response reads with a bounded body size.
+- Per-attempt latency budget is also applied to connect/read timeouts.
+- Retry backoff is interruptible.
+- Useful exit codes and final status accounting.
 
 Supported input forms:
     host:port
@@ -25,6 +41,7 @@ SOCKS support requires:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ipaddress
 import json
 import os
@@ -32,6 +49,7 @@ import random
 import re
 import signal
 import socket
+import sqlite3
 import sys
 import tempfile
 import time
@@ -40,25 +58,32 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import BinaryIO, Iterable, Iterator, Sequence, TextIO
+from typing import Iterable, Iterator, Sequence, TextIO
 from urllib.parse import quote, unquote, urlsplit
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 
 
-VERSION = "11.0"
+VERSION = "12.0"
+
 DEFAULT_TEST_URLS = (
     "https://api.ipify.org?format=json",
     "https://icanhazip.com/",
     "https://ifconfig.me/ip",
 )
+
 SUPPORTED_PROTOCOLS = ("http", "https", "socks5", "socks5h", "socks4")
 SOCKS_PROTOCOLS = frozenset({"socks4", "socks5", "socks5h"})
+
 MAX_RESPONSE_BYTES = 64 * 1024
+DEFAULT_DEDUP_MEMORY_THRESHOLD_MB = 128
+
 STOP_EVENT = Event()
+
 BRACKETED_AUTH_RE = re.compile(
-    r"^\[(?P<host>[^\]]+)]:(?P<port>\d+):(?P<user>[^:]*):(?P<password>.*)$"
+    r"^\[(?P<host>[^\]]+)\]:(?P<port>\d+):(?P<user>[^:]*):(?P<password>.*)$"
 )
 
 
@@ -120,17 +145,27 @@ def normalize_host(host: str) -> str:
 
 def validate_host(host: str) -> str:
     host = normalize_host(host)
-    if not host or any(char.isspace() for char in host):
-        raise ValueError("invalid host")
+    if not host:
+        raise ValueError("empty host")
+    if any(char.isspace() for char in host):
+        raise ValueError("host contains whitespace")
     if any(char in host for char in "/?#@"):
         raise ValueError("host contains invalid URL characters")
+    if "\x00" in host:
+        raise ValueError("host contains NUL byte")
+
+    # If it looks like an IP literal, validate it. Hostnames are left to the
+    # resolver because IDNA and private naming conventions vary by environment.
+    with contextlib.suppress(ValueError):
+        return str(ipaddress.ip_address(host))
+
     return host
 
 
-def validate_port(port_text: str) -> int:
+def validate_port(port_text: str | int) -> int:
     try:
         port = int(port_text)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("port is not an integer") from exc
     if not 1 <= port <= 65535:
         raise ValueError("port outside 1..65535")
@@ -147,15 +182,26 @@ def format_host_for_url(host: str) -> str:
 
 def parse_host_port(value: str) -> tuple[str, int]:
     value = value.strip()
+    if not value:
+        raise ValueError("empty address")
+
     if value.startswith("["):
         end = value.find("]")
-        if end < 0 or value[end + 1 : end + 2] != ":":
-            raise ValueError("invalid bracketed IPv6 format")
+        if end < 0:
+            raise ValueError("missing closing bracket in IPv6 address")
+        if value[end + 1 : end + 2] != ":":
+            raise ValueError("missing port after bracketed IPv6 address")
         host = value[1:end]
         port_text = value[end + 2 :]
+        if ":" in port_text:
+            raise ValueError("unexpected extra fields after port")
     else:
+        # Unbracketed IPv6 is intentionally rejected because host:port is
+        # ambiguous. Brackets make the input unambiguous and URL-safe.
+        if value.count(":") > 1:
+            raise ValueError("IPv6 addresses must be enclosed in brackets")
         host, separator, port_text = value.rpartition(":")
-        if not separator or not host:
+        if not separator or not host or not port_text:
             raise ValueError("missing host or port")
 
     return validate_host(host), validate_port(port_text)
@@ -169,22 +215,32 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
     if "://" in raw:
         try:
             parsed = urlsplit(raw)
-            scheme = parsed.scheme.lower()
-            if scheme not in SUPPORTED_PROTOCOLS:
-                raise ValueError(f"unsupported scheme: {scheme}")
-            if parsed.hostname is None or parsed.port is None:
-                raise ValueError("missing host or port")
-            if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-                raise ValueError("proxy URL must not contain path, query or fragment")
-            host = validate_host(parsed.hostname)
-            port = parsed.port
-        except ValueError:
-            raise
         except Exception as exc:
             raise ValueError(f"invalid proxy URL: {exc}") from exc
 
+        scheme = parsed.scheme.lower()
+        if scheme not in SUPPORTED_PROTOCOLS:
+            raise ValueError(f"unsupported scheme: {scheme}")
+
+        try:
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"invalid proxy URL: {exc}") from exc
+
+        if hostname is None or port is None:
+            raise ValueError("missing host or port")
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise ValueError("proxy URL must not contain path, query or fragment")
+
+        host = validate_host(hostname)
+        port = validate_port(port)
         username = unquote(parsed.username) if parsed.username is not None else None
         password = unquote(parsed.password) if parsed.password is not None else None
+
+        if password is not None and username is None:
+            raise ValueError("password supplied without username")
+
         return ProxyCandidate(raw, host, port, username, password, (scheme,))
 
     if "@" in raw:
@@ -214,6 +270,7 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
         )
 
     # Common host:port:user:password form. Password may contain colons.
+    # Unbracketed IPv6 is not accepted here because it is ambiguous.
     parts = raw.split(":")
     if len(parts) >= 4 and not raw.startswith("["):
         host = parts[0].strip()
@@ -238,7 +295,11 @@ def canonical_proxy_url(candidate: ProxyCandidate, protocol: str) -> str:
         user = quote(candidate.username, safe="")
         password = quote(candidate.password or "", safe="")
         auth = f"{user}:{password}@"
-    return f"{protocol}://{auth}{format_host_for_url(candidate.host)}:{candidate.port}"
+
+    return (
+        f"{protocol}://{auth}"
+        f"{format_host_for_url(candidate.host)}:{candidate.port}"
+    )
 
 
 def output_proxy_value(result: CheckResult, mode: str) -> str:
@@ -247,14 +308,46 @@ def output_proxy_value(result: CheckResult, mode: str) -> str:
     return result.canonical_url
 
 
-def create_session(user_agent: str) -> requests.Session:
-    """Create a session scoped to one proxy candidate.
+def redact_proxy_value(value: str) -> str:
+    """Best-effort credential masking for logs/reports."""
+    try:
+        if "://" in value:
+            parsed = urlsplit(value)
+            if parsed.username is None:
+                return value
 
-    requests/urllib3 caches a ProxyManager for every distinct proxy URL inside
-    an HTTPAdapter. Reusing one thread-local Session across a huge proxy list
-    therefore makes memory usage grow with the number of tested proxies. A
-    per-candidate Session keeps connection reuse for retries/endpoints while
-    bounding that cache to only this candidate's protocol variants.
+            host = parsed.hostname or ""
+            host = format_host_for_url(host)
+            port = f":{parsed.port}" if parsed.port is not None else ""
+            return f"{parsed.scheme}://***:***@{host}{port}"
+
+        if "@" in value:
+            _auth, address = value.rsplit("@", 1)
+            return f"***:***@{address}"
+
+        bracketed = BRACKETED_AUTH_RE.match(value)
+        if bracketed:
+            return (
+                f"[{bracketed.group('host')}]:{bracketed.group('port')}:***:***"
+            )
+
+        parts = value.split(":")
+        if len(parts) >= 4 and parts[1].isdigit():
+            return f"{parts[0]}:{parts[1]}:***:***"
+    except Exception:
+        pass
+
+    return value
+
+
+def create_session(user_agent: str) -> requests.Session:
+    """
+    Create one session per proxy candidate.
+
+    requests/urllib3 caches a ProxyManager per proxy URL in an HTTPAdapter.
+    A session shared across a huge proxy list therefore grows with the number
+    of proxies seen. Per-candidate sessions bound that cache while preserving
+    connection reuse across retries/endpoints for the same candidate.
     """
     session = requests.Session()
     session.trust_env = False
@@ -265,6 +358,7 @@ def create_session(user_agent: str) -> requests.Session:
             "Connection": "keep-alive",
         }
     )
+
     adapter = HTTPAdapter(
         pool_connections=4,
         pool_maxsize=4,
@@ -296,33 +390,39 @@ def read_limited_response(
 ) -> tuple[bytes, bool]:
     chunks: list[bytes] = []
     size = 0
-    deadline_exceeded = False
+
     for chunk in response.iter_content(chunk_size=4096):
         if deadline is not None and time.perf_counter() > deadline:
-            deadline_exceeded = True
-            break
+            return b"".join(chunks), True
+
         if not chunk:
             continue
+
         remaining = limit - size
         if remaining <= 0:
             break
+
         piece = chunk[:remaining]
         chunks.append(piece)
         size += len(piece)
+
         if size >= limit:
             break
-    return b"".join(chunks), deadline_exceeded
+
+    return b"".join(chunks), False
 
 
 def extract_ip(payload_bytes: bytes) -> str | None:
     text = payload_bytes.decode("utf-8", errors="replace").strip()
     payload: object | None = None
+
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
 
     candidates: list[str] = []
+
     if isinstance(payload, dict):
         for key in ("ip", "origin", "query"):
             value = payload.get(key)
@@ -331,17 +431,29 @@ def extract_ip(payload_bytes: bytes) -> str | None:
     elif isinstance(payload, str):
         candidates.append(payload.strip())
 
-    candidates.extend(part.strip() for part in text.replace("\n", ",").split(","))
+    # Covers common plain-text endpoints and "a.b.c.d, e.f.g.h" origin forms.
+    candidates.extend(
+        part.strip()
+        for part in text.replace("\r", "\n").replace("\n", ",").split(",")
+    )
+
     for candidate in candidates:
-        candidate = candidate.strip().strip('"')
+        candidate = candidate.strip().strip('"').strip("'")
         if not candidate:
             continue
+
+        # Some services can return a label followed by an IP.
         if " " in candidate:
             candidate = candidate.rsplit(" ", 1)[-1]
+
+        # Be tolerant of a trailing punctuation mark in text responses.
+        candidate = candidate.strip("[](){}<>;")
+
         try:
             return str(ipaddress.ip_address(candidate))
         except ValueError:
             continue
+
     return None
 
 
@@ -356,6 +468,8 @@ def classify_request_error(exc: requests.RequestException) -> str:
         return "ssl_error"
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "connection_error"
+    if isinstance(exc, requests.exceptions.TooManyRedirects):
+        return "too_many_redirects"
     return exc.__class__.__name__.lower()
 
 
@@ -364,6 +478,21 @@ def compact_error(exc: BaseException, limit: int = 300) -> str:
     if len(text) > limit:
         text = text[: limit - 3] + "..."
     return text
+
+
+def bounded_request_timeout(
+    *,
+    connect_timeout: float,
+    read_timeout: float,
+    max_latency: float,
+) -> tuple[float, float]:
+    # requests has no true total wall-clock timeout. Bounding both socket
+    # phases by the latency limit prevents a single phase from exceeding the
+    # accepted total by a large margin.
+    return (
+        min(connect_timeout, max_latency),
+        min(read_timeout, max_latency),
+    )
 
 
 def check_proxy(
@@ -408,9 +537,13 @@ def check_proxy(
     last_status = "dead"
     last_error: str | None = None
     attempts = 0
-    # A local RNG avoids contention on the module-level random generator when
-    # hundreds of worker threads finish/start requests at the same time.
+
     rng = random.Random(os.urandom(16))
+    request_timeout = bounded_request_timeout(
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        max_latency=max_latency,
+    )
 
     try:
         for protocol in candidate.protocols:
@@ -418,7 +551,9 @@ def check_proxy(
                 return CheckResult(raw_proxy, "cancelled", attempts=attempts)
 
             proxy_url = canonical_proxy_url(candidate, protocol)
-            proxies = {"http": proxy_url, "https": proxy_url}
+            proxy_mapping = {"http": proxy_url, "https": proxy_url}
+
+            skip_protocol = False
 
             for retry_index in range(retries + 1):
                 endpoints = list(test_urls)
@@ -427,7 +562,12 @@ def check_proxy(
 
                 for endpoint in endpoints:
                     if STOP_EVENT.is_set():
-                        return CheckResult(raw_proxy, "cancelled", attempts=attempts)
+                        return CheckResult(
+                            raw_proxy,
+                            "cancelled",
+                            attempts=attempts,
+                        )
+
                     if max_attempts and attempts >= max_attempts:
                         return CheckResult(
                             raw_proxy,
@@ -438,11 +578,12 @@ def check_proxy(
 
                     attempts += 1
                     started = time.perf_counter()
+
                     try:
                         with session.get(
                             endpoint,
-                            proxies=proxies,
-                            timeout=(connect_timeout, read_timeout),
+                            proxies=proxy_mapping,
+                            timeout=request_timeout,
                             verify=verify_tls,
                             allow_redirects=True,
                             stream=True,
@@ -453,18 +594,23 @@ def check_proxy(
                             if response.status_code != 200:
                                 if response.status_code == 407:
                                     last_status = "proxy_auth_required"
-                                else:
-                                    last_status = f"http_{response.status_code}"
+                                    last_error = "proxy returned HTTP 407"
+                                    # Authentication failure is deterministic
+                                    # for this protocol/credential tuple.
+                                    skip_protocol = True
+                                    break
+
+                                last_status = f"http_{response.status_code}"
                                 last_error = (
                                     f"endpoint returned HTTP {response.status_code}"
                                 )
                                 continue
 
-                            # If even TTFB already exceeded the limit there is no
-                            # reason to spend more time reading the body.
                             if ttfb > max_latency:
                                 last_status = "too_slow"
-                                last_error = f"TTFB {ttfb:.3f}s > {max_latency:.3f}s"
+                                last_error = (
+                                    f"TTFB {ttfb:.3f}s > {max_latency:.3f}s"
+                                )
                                 continue
 
                             body, deadline_exceeded = read_limited_response(
@@ -473,6 +619,7 @@ def check_proxy(
                                 deadline=started + max_latency,
                             )
                             latency = time.perf_counter() - started
+
                             if deadline_exceeded or latency > max_latency:
                                 last_status = "too_slow"
                                 last_error = (
@@ -499,6 +646,7 @@ def check_proxy(
                                 canonical_url=proxy_url,
                                 attempts=attempts,
                             )
+
                     except requests.RequestException as exc:
                         last_status = classify_request_error(exc)
                         last_error = compact_error(exc)
@@ -508,18 +656,29 @@ def check_proxy(
                             f"{exc.__class__.__name__}: {compact_error(exc)}"
                         )
 
+                if skip_protocol:
+                    break
+
                 if retry_index < retries:
-                    delay = retry_backoff * (2**retry_index)
-                    delay += rng.uniform(0.0, max(0.001, delay * 0.25))
+                    base_delay = retry_backoff * (2**retry_index)
+                    delay = base_delay + rng.uniform(
+                        0.0,
+                        max(0.001, base_delay * 0.25),
+                    )
                     if STOP_EVENT.wait(delay):
                         return CheckResult(
-                            raw_proxy, "cancelled", attempts=attempts
+                            raw_proxy,
+                            "cancelled",
+                            attempts=attempts,
                         )
     finally:
         session.close()
 
     return CheckResult(
-        raw_proxy, last_status, error=last_error, attempts=attempts
+        raw_proxy,
+        last_status,
+        error=last_error,
+        attempts=attempts,
     )
 
 
@@ -532,25 +691,114 @@ def iter_input_lines(path: Path) -> Iterator[str]:
 
 
 def create_temp_path(directory: Path, prefix: str, suffix: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
     os.close(fd)
     return Path(name)
 
 
-def prepare_unique_source(input_path: Path, temp_dir: Path) -> tuple[Path, int, int]:
-    """Deduplicate once, while creating a restartable temporary source."""
-    source_path = create_temp_path(temp_dir, ".proxy-source.", ".txt")
+def deduplicate_memory(
+    input_path: Path,
+    source_path: Path,
+) -> tuple[int, int]:
     seen: set[str] = set()
     duplicates = 0
+
+    with source_path.open("w", encoding="utf-8", newline="\n") as output:
+        for value in iter_input_lines(input_path):
+            if value in seen:
+                duplicates += 1
+                continue
+            seen.add(value)
+            output.write(value + "\n")
+
+    return len(seen), duplicates
+
+
+def deduplicate_sqlite(
+    input_path: Path,
+    source_path: Path,
+    temp_dir: Path,
+) -> tuple[int, int]:
+    """
+    Deduplicate without retaining the full unique set in Python memory.
+
+    SQLite preserves uniqueness with a primary key while the source file keeps
+    first-seen order. This is slower than a set but much safer for huge lists.
+    """
+    db_path = create_temp_path(temp_dir, ".proxy-dedup.", ".sqlite3")
+    total = 0
+    duplicates = 0
+
     try:
-        with source_path.open("w", encoding="utf-8", newline="\n") as output:
-            for value in iter_input_lines(input_path):
-                if value in seen:
-                    duplicates += 1
-                    continue
-                seen.add(value)
-                output.write(value + "\n")
-        return source_path, len(seen), duplicates
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("CREATE TABLE seen (value TEXT PRIMARY KEY) WITHOUT ROWID")
+
+            with source_path.open("w", encoding="utf-8", newline="\n") as output:
+                conn.execute("BEGIN")
+                pending = 0
+
+                for value in iter_input_lines(input_path):
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO seen(value) VALUES (?)",
+                        (value,),
+                    )
+
+                    if cursor.rowcount == 1:
+                        total += 1
+                        output.write(value + "\n")
+                    else:
+                        duplicates += 1
+
+                    pending += 1
+                    if pending >= 10_000:
+                        conn.commit()
+                        conn.execute("BEGIN")
+                        pending = 0
+
+                conn.commit()
+        finally:
+            conn.close()
+    finally:
+        db_path.unlink(missing_ok=True)
+
+    return total, duplicates
+
+
+def prepare_unique_source(
+    input_path: Path,
+    temp_dir: Path,
+    *,
+    mode: str,
+    memory_threshold_mb: int,
+) -> tuple[Path, int, int, str]:
+    source_path = create_temp_path(temp_dir, ".proxy-source.", ".txt")
+
+    if mode == "auto":
+        threshold_bytes = memory_threshold_mb * 1024 * 1024
+        effective_mode = (
+            "sqlite"
+            if input_path.stat().st_size >= threshold_bytes
+            else "memory"
+        )
+    else:
+        effective_mode = mode
+
+    try:
+        if effective_mode == "sqlite":
+            total, duplicates = deduplicate_sqlite(
+                input_path,
+                source_path,
+                temp_dir,
+            )
+        else:
+            total, duplicates = deduplicate_memory(input_path, source_path)
+
+        return source_path, total, duplicates, effective_mode
     except BaseException:
         source_path.unlink(missing_ok=True)
         raise
@@ -558,6 +806,7 @@ def prepare_unique_source(input_path: Path, temp_dir: Path) -> tuple[Path, int, 
 
 def parse_protocols(value: str) -> tuple[str, ...]:
     protocols: list[str] = []
+
     for item in value.split(","):
         protocol = item.strip().lower()
         if not protocol:
@@ -569,39 +818,62 @@ def parse_protocols(value: str) -> tuple[str, ...]:
             )
         if protocol not in protocols:
             protocols.append(protocol)
+
     if not protocols:
         raise argparse.ArgumentTypeError("at least one protocol is required")
+
     return tuple(protocols)
 
 
 def positive_int(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
     if number < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return number
 
 
 def non_negative_int(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
     if number < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
     return number
 
 
 def positive_float(value: str) -> float:
-    number = float(value)
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
     if number <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
     return number
 
 
-def validate_test_urls(parser: argparse.ArgumentParser, urls: Sequence[str]) -> tuple[str, ...]:
+def validate_test_urls(
+    parser: argparse.ArgumentParser,
+    urls: Sequence[str],
+) -> tuple[str, ...]:
     validated: list[str] = []
+
     for url in urls:
         parsed = urlsplit(url)
+
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             parser.error(f"invalid --test-url: {url!r}")
+        if parsed.username is not None or parsed.password is not None:
+            parser.error(f"--test-url must not contain credentials: {url!r}")
+
         validated.append(url)
+
+    if not validated:
+        parser.error("at least one test URL is required")
+
     return tuple(validated)
 
 
@@ -618,6 +890,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Validate large HTTP/SOCKS proxy lists.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
     parser.add_argument("input", type=Path, help="input proxy list")
     parser.add_argument("output", type=Path, help="output file with valid proxies")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -641,6 +914,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="test_urls",
         help="test endpoint; repeat to add multiple endpoints",
     )
+
     parser.add_argument("--connect-timeout", type=positive_float, default=2.5)
     parser.add_argument("--read-timeout", type=positive_float, default=5.0)
     parser.add_argument("--tcp-timeout", type=positive_float, default=1.5)
@@ -648,7 +922,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-attempts",
         type=non_negative_int,
-        default=0,
+        default=6,
         help=(
             "maximum HTTP attempts per proxy across protocols/endpoints/retries; "
             "0 means unlimited"
@@ -666,18 +940,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-require-ip",
         action="store_true",
-        help="accept any HTTP 200 response instead of requiring a valid IP",
+        help="accept HTTP 200 even if no valid IP can be extracted",
     )
+
     parser.add_argument(
         "--shuffle",
         action="store_true",
         help="shuffle unique input in memory before validation",
     )
     parser.add_argument(
+        "--dedup-mode",
+        choices=("auto", "memory", "sqlite"),
+        default="auto",
+        help="deduplication backend",
+    )
+    parser.add_argument(
+        "--dedup-memory-threshold-mb",
+        type=positive_int,
+        default=DEFAULT_DEDUP_MEMORY_THRESHOLD_MB,
+        help="in auto mode, use SQLite when input file is at least this large",
+    )
+
+    parser.add_argument(
         "--details",
         type=Path,
-        help="TSV report for every checked proxy, including failures",
+        help="TSV report for every completed proxy, including failures",
     )
+    parser.add_argument(
+        "--redact-details",
+        action="store_true",
+        help="mask proxy credentials in the TSV details file",
+    )
+
     parser.add_argument("--progress-every", type=positive_int, default=250)
     parser.add_argument(
         "--flush-every",
@@ -694,51 +988,121 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-format",
         choices=("original", "url"),
         default="original",
-        help="write the original line or the successful canonical proxy URL",
+        help="write original input or successful canonical proxy URL",
+    )
+    parser.add_argument(
+        "--durable-output",
+        action="store_true",
+        help="fsync temporary output files and destination directories",
     )
     parser.add_argument(
         "--user-agent",
         default=f"ProxyValidator/{VERSION}",
     )
+
     return parser
 
 
-def atomic_replace(temp_path: Path, destination: Path) -> None:
+def fsync_file(handle: TextIO) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+
+    flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_replace(
+    temp_path: Path,
+    destination: Path,
+    *,
+    durable: bool,
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     os.replace(temp_path, destination)
+
+    if durable:
+        fsync_directory(destination.parent)
 
 
 def tsv_cell(value: object | None) -> str:
     if value is None:
         return ""
-    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    return (
+        str(value)
+        .replace("\t", " ")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
 
 
-def write_detail(handle: TextIO, result: CheckResult) -> None:
-    latency_ms = "" if result.latency is None else f"{result.latency * 1000:.1f}"
-    ttfb_ms = "" if result.ttfb is None else f"{result.ttfb * 1000:.1f}"
+def write_detail(
+    handle: TextIO,
+    result: CheckResult,
+    *,
+    redact_credentials: bool,
+) -> None:
+    latency_ms = (
+        ""
+        if result.latency is None
+        else f"{result.latency * 1000:.1f}"
+    )
+    ttfb_ms = (
+        ""
+        if result.ttfb is None
+        else f"{result.ttfb * 1000:.1f}"
+    )
+
+    proxy_value = (
+        redact_proxy_value(result.proxy)
+        if redact_credentials
+        else result.proxy
+    )
+
+    canonical_url = result.canonical_url
+    if redact_credentials and canonical_url:
+        canonical_url = redact_proxy_value(canonical_url)
+
     fields = (
-        result.proxy,
+        proxy_value,
         result.status,
         result.protocol,
         latency_ms,
         ttfb_ms,
         result.exit_ip,
         result.endpoint,
+        canonical_url,
         result.attempts,
         result.error,
     )
     handle.write("\t".join(tsv_cell(item) for item in fields) + "\n")
 
 
-def print_progress(state: RunState, total: int, active: int, started: float) -> None:
+def print_progress(
+    state: RunState,
+    total: int,
+    active: int,
+    started: float,
+) -> None:
     elapsed = max(time.perf_counter() - started, 0.001)
     speed = state.checked / elapsed
     remaining = max(total - state.checked, 0)
     eta = remaining / speed if speed > 0 else 0.0
+
     print(
-        f"[{state.checked}/{total}] valid={state.valid} active={active} "
-        f"speed={speed:.1f}/s eta={eta:.0f}s",
+        f"[{state.checked}/{total}] "
+        f"valid={state.valid} "
+        f"active={active} "
+        f"speed={speed:.1f}/s "
+        f"eta={eta:.0f}s",
         flush=True,
     )
 
@@ -755,13 +1119,19 @@ def process_result(
 ) -> None:
     state.checked += 1
     stats[result.status] += 1
+
     if details is not None:
-        write_detail(details, result)
+        write_detail(
+            details,
+            result,
+            redact_credentials=args.redact_details,
+        )
 
     if result.status != "ok":
         return
 
     state.valid += 1
+
     if args.sort:
         valid_results.append(result)
         return
@@ -781,7 +1151,12 @@ def run_checks(
     state = RunState()
     stats: Counter[str] = Counter()
     valid_results: list[CheckResult] = []
-    inflight_limit = max(args.workers, args.inflight or args.workers * 3)
+
+    inflight_limit = max(
+        args.workers,
+        args.inflight or args.workers * 3,
+    )
+
     futures: dict[Future[CheckResult], str] = {}
     source_iter = iter(source)
     completed_since_flush = 0
@@ -807,6 +1182,7 @@ def run_checks(
         max_workers=args.workers,
         thread_name_prefix="proxy-check",
     )
+
     try:
         while True:
             while (
@@ -819,11 +1195,16 @@ def run_checks(
                 except StopIteration:
                     state.source_exhausted = True
                     break
-                future = executor.submit(check_proxy, proxy, **check_kwargs)
+
+                future = executor.submit(
+                    check_proxy,
+                    proxy,
+                    **check_kwargs,
+                )
                 futures[future] = proxy
                 state.submitted += 1
 
-            if STOP_EVENT.is_set():
+            if STOP_EVENT.is_set() and not state.interrupted:
                 state.interrupted = True
                 for future in futures:
                     future.cancel()
@@ -831,12 +1212,17 @@ def run_checks(
             if not futures:
                 break
 
-            done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+            done, _ = wait(
+                futures,
+                timeout=0.25,
+                return_when=FIRST_COMPLETED,
+            )
             if not done:
                 continue
 
             for future in done:
                 proxy = futures.pop(future)
+
                 if future.cancelled():
                     result = CheckResult(proxy, "cancelled")
                 else:
@@ -846,8 +1232,12 @@ def run_checks(
                         result = CheckResult(
                             proxy,
                             "worker_error",
-                            error=f"{exc.__class__.__name__}: {compact_error(exc)}",
+                            error=(
+                                f"{exc.__class__.__name__}: "
+                                f"{compact_error(exc)}"
+                            ),
                         )
+
                 process_result(
                     result,
                     args=args,
@@ -866,67 +1256,113 @@ def run_checks(
                 completed_since_flush = 0
 
             if state.checked >= next_progress or state.checked == total:
-                print_progress(state, total, len(futures), started)
+                print_progress(
+                    state,
+                    total,
+                    len(futures),
+                    started,
+                )
                 while next_progress <= state.checked:
                     next_progress += args.progress_every
 
             if state.interrupted and not futures:
                 break
     finally:
+        # Running requests cannot be forcefully killed by ThreadPoolExecutor.
+        # Their bounded socket timeouts ensure shutdown remains finite.
         executor.shutdown(wait=True, cancel_futures=True)
 
     return state, stats, valid_results
 
 
+def paths_conflict(
+    input_path: Path,
+    output_path: Path,
+    details_path: Path | None,
+) -> str | None:
+    input_resolved = input_path.resolve()
+    output_resolved = output_path.resolve()
+
+    if input_resolved == output_resolved:
+        return "input and output paths must be different"
+
+    if details_path is not None:
+        details_resolved = details_path.resolve()
+        if details_resolved in {input_resolved, output_resolved}:
+            return "--details must differ from input and output"
+
+    return None
+
+
 def main() -> int:
     STOP_EVENT.clear()
+
     parser = build_parser()
     args = parser.parse_args()
 
     input_path: Path = args.input
     output_path: Path = args.output
+
     if not input_path.is_file():
         parser.error(f"input file does not exist: {input_path}")
-    if input_path.resolve() == output_path.resolve():
-        parser.error("input and output paths must be different")
-    if args.details and args.details.resolve() in {input_path.resolve(), output_path.resolve()}:
-        parser.error("--details must differ from input and output")
 
-    args.test_urls = validate_test_urls(parser, args.test_urls or DEFAULT_TEST_URLS)
+    conflict = paths_conflict(input_path, output_path, args.details)
+    if conflict:
+        parser.error(conflict)
+
+    args.test_urls = validate_test_urls(
+        parser,
+        args.test_urls or DEFAULT_TEST_URLS,
+    )
+
     if any(protocol in SOCKS_PROTOCOLS for protocol in args.protocols):
         if not socks_dependency_available():
             parser.error(
-                'SOCKS protocols requested, but PySocks is unavailable; install '
-                'with: python -m pip install "requests[socks]"'
+                'SOCKS protocols requested, but PySocks is unavailable; '
+                'install with: python -m pip install "requests[socks]"'
             )
 
     if args.insecure:
-        requests.packages.urllib3.disable_warnings(  # type: ignore[attr-defined]
-            requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore[attr-defined]
-        )
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     install_signal_handlers()
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("Preparing unique proxy list...", flush=True)
-    source_path, total, duplicates = prepare_unique_source(input_path, output_path.parent)
+    source_path, total, duplicates, dedup_mode = prepare_unique_source(
+        input_path,
+        output_path.parent,
+        mode=args.dedup_mode,
+        memory_threshold_mb=args.dedup_memory_threshold_mb,
+    )
+
     if total == 0:
-        output_path.write_text("", encoding="utf-8")
-        if args.details:
-            args.details.parent.mkdir(parents=True, exist_ok=True)
-            args.details.write_text(
-                "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\texit_ip\tendpoint\tattempts\terror\n",
-                encoding="utf-8",
-            )
-        source_path.unlink(missing_ok=True)
+        try:
+            output_path.write_text("", encoding="utf-8")
+
+            if args.details:
+                args.details.parent.mkdir(parents=True, exist_ok=True)
+                args.details.write_text(
+                    "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\t"
+                    "exit_ip\tendpoint\tcanonical_url\tattempts\terror\n",
+                    encoding="utf-8",
+                )
+        finally:
+            source_path.unlink(missing_ok=True)
+
         print("Input contains no proxies.")
         return 0
 
-    print(f"Unique: {total}; duplicates skipped: {duplicates}", flush=True)
+    print(
+        f"Unique: {total}; duplicates skipped: {duplicates}; "
+        f"dedup={dedup_mode}",
+        flush=True,
+    )
 
     if args.shuffle:
         source_list = list(iter_input_lines(source_path))
-        random.shuffle(source_list)
+        random.SystemRandom().shuffle(source_list)
         source: Iterable[str] = source_list
     else:
         source = iter_input_lines(source_path)
@@ -936,6 +1372,7 @@ def main() -> int:
         f".{output_path.name}.",
         ".tmp",
     )
+
     temp_details: Path | None = None
     if args.details:
         args.details.parent.mkdir(parents=True, exist_ok=True)
@@ -951,16 +1388,28 @@ def main() -> int:
     valid_results: list[CheckResult] = []
 
     try:
-        with temp_output.open("w", encoding="utf-8", buffering=1024 * 1024) as output:
+        with temp_output.open(
+            "w",
+            encoding="utf-8",
+            buffering=1024 * 1024,
+            newline="\n",
+        ) as output:
             details_handle = (
-                temp_details.open("w", encoding="utf-8", buffering=1024 * 1024)
+                temp_details.open(
+                    "w",
+                    encoding="utf-8",
+                    buffering=1024 * 1024,
+                    newline="\n",
+                )
                 if temp_details is not None
                 else None
             )
+
             try:
                 if details_handle is not None:
                     details_handle.write(
-                        "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\texit_ip\tendpoint\tattempts\terror\n"
+                        "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\t"
+                        "exit_ip\tendpoint\tcanonical_url\tattempts\terror\n"
                     )
 
                 state, stats, valid_results = run_checks(
@@ -974,43 +1423,77 @@ def main() -> int:
 
                 if args.sort and valid_results:
                     valid_results.sort(
-                        key=lambda item: item.latency if item.latency is not None else float("inf")
+                        key=lambda item: (
+                            item.latency
+                            if item.latency is not None
+                            else float("inf")
+                        )
                     )
                     for result in valid_results:
                         output.write(
-                            output_proxy_value(result, args.output_format) + "\n"
+                            output_proxy_value(
+                                result,
+                                args.output_format,
+                            )
+                            + "\n"
                         )
 
-                output.flush()
-                if details_handle is not None:
-                    details_handle.flush()
+                if args.durable_output:
+                    fsync_file(output)
+                    if details_handle is not None:
+                        fsync_file(details_handle)
+                else:
+                    output.flush()
+                    if details_handle is not None:
+                        details_handle.flush()
+
             finally:
                 if details_handle is not None:
                     details_handle.close()
 
-        atomic_replace(temp_output, output_path)
+        atomic_replace(
+            temp_output,
+            output_path,
+            durable=args.durable_output,
+        )
+
         if temp_details is not None and args.details is not None:
-            atomic_replace(temp_details, args.details)
+            atomic_replace(
+                temp_details,
+                args.details,
+                durable=args.durable_output,
+            )
+
     except BaseException:
-        print(f"Partial valid results remain in: {temp_output}", file=sys.stderr)
+        print(
+            f"Partial valid results remain in: {temp_output}",
+            file=sys.stderr,
+        )
         if temp_details is not None:
-            print(f"Partial details remain in: {temp_details}", file=sys.stderr)
+            print(
+                f"Partial details remain in: {temp_details}",
+                file=sys.stderr,
+            )
         raise
     finally:
         source_path.unlink(missing_ok=True)
 
     elapsed = max(time.perf_counter() - started, 0.001)
+
     print()
     print(f"Finished in {elapsed:.2f}s")
     print(f"Checked: {state.checked}/{total}")
+    print(f"Submitted: {state.submitted}/{total}")
     print(f"Valid:   {state.valid}")
     print(f"Speed:   {state.checked / elapsed:.1f} proxies/s")
     print(f"Output:  {output_path}")
+
     if args.details:
         print(f"Details: {args.details}")
+
     print("Statuses:")
     for status, count in stats.most_common():
-        print(f"  {status:<20} {count}")
+        print(f"  {status:<22} {count}")
 
     return 130 if state.interrupted else 0
 
