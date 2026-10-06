@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Proxy Validator v12
+Proxy Validator v13
 
 Robust, bounded-concurrency validator for large HTTP, HTTPS-to-proxy,
 SOCKS4, SOCKS5 and SOCKS5h proxy lists.
@@ -11,6 +11,10 @@ Highlights:
 - Bounded in-flight futures and graceful interruption.
 - Per-candidate requests.Session prevents unbounded ProxyManager growth.
 - Deterministic failures such as HTTP 407 do not waste retries.
+- Failed checks retain protocol/endpoint/latency metadata for better diagnostics.
+- User-specified in-flight limits are honored exactly.
+- Non-finite timeout values are rejected.
+- Credential redaction also covers exception text.
 - Optional hard cap on HTTP attempts per proxy.
 - Memory or SQLite-backed input deduplication.
 - Atomic, optionally durable output replacement.
@@ -44,6 +48,7 @@ import argparse
 import contextlib
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -66,7 +71,7 @@ import urllib3
 from requests.adapters import HTTPAdapter
 
 
-VERSION = "12.0"
+VERSION = "13.0"
 
 DEFAULT_TEST_URLS = (
     "https://api.ipify.org?format=json",
@@ -79,11 +84,19 @@ SOCKS_PROTOCOLS = frozenset({"socks4", "socks5", "socks5h"})
 
 MAX_RESPONSE_BYTES = 64 * 1024
 DEFAULT_DEDUP_MEMORY_THRESHOLD_MB = 128
+DETAILS_HEADER = (
+    "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\t"
+    "exit_ip\tendpoint\tcanonical_url\tattempts\terror\n"
+)
 
 STOP_EVENT = Event()
 
 BRACKETED_AUTH_RE = re.compile(
     r"^\[(?P<host>[^\]]+)\]:(?P<port>\d+):(?P<user>[^:]*):(?P<password>.*)$"
+)
+URL_AUTH_RE = re.compile(
+    r"\b(?P<scheme>https?|socks4|socks5h?)://[^/@\s]+@",
+    re.IGNORECASE,
 )
 
 
@@ -121,15 +134,30 @@ class RunState:
 
 
 def install_signal_handlers() -> None:
+    signal_count = 0
+
     def handle_stop(signum: int, _frame: object) -> None:
-        if STOP_EVENT.is_set():
+        nonlocal signal_count
+        signal_count += 1
+
+        if signal_count == 1:
+            print(
+                f"\nReceived signal {signum}; stopping new submissions...",
+                file=sys.stderr,
+                flush=True,
+            )
+            STOP_EVENT.set()
             return
+
+        # A second interrupt is an explicit request to stop immediately.
+        # ThreadPoolExecutor workers cannot be killed safely, so os._exit() is
+        # the only reliable way to avoid waiting for in-flight socket timeouts.
         print(
-            f"\nReceived signal {signum}; stopping new submissions...",
+            f"\nReceived signal {signum} again; forcing immediate exit.",
             file=sys.stderr,
             flush=True,
         )
-        STOP_EVENT.set()
+        os._exit(128 + signum)
 
     signal.signal(signal.SIGINT, handle_stop)
     if hasattr(signal, "SIGTERM"):
@@ -149,10 +177,10 @@ def validate_host(host: str) -> str:
         raise ValueError("empty host")
     if any(char.isspace() for char in host):
         raise ValueError("host contains whitespace")
-    if any(char in host for char in "/?#@"):
+    if any(ord(char) < 32 or ord(char) == 127 for char in host):
+        raise ValueError("host contains control characters")
+    if any(char in host for char in "/?#@\\"):
         raise ValueError("host contains invalid URL characters")
-    if "\x00" in host:
-        raise ValueError("host contains NUL byte")
 
     # If it looks like an IP literal, validate it. Hostnames are left to the
     # resolver because IDNA and private naming conventions vary by environment.
@@ -340,6 +368,23 @@ def redact_proxy_value(value: str) -> str:
     return value
 
 
+def redact_error_text(result: CheckResult) -> str | None:
+    if result.error is None:
+        return None
+
+    text = result.error
+    for value in (result.proxy, result.canonical_url):
+        if value:
+            text = text.replace(value, redact_proxy_value(value))
+
+    # requests/urllib3 may normalize or re-render a proxy URL inside a nested
+    # exception, so exact replacement alone is not sufficient.
+    return URL_AUTH_RE.sub(
+        lambda match: f"{match.group('scheme')}://***:***@",
+        text,
+    )
+
+
 def create_session(user_agent: str) -> requests.Session:
     """
     Create one session per proxy candidate.
@@ -457,20 +502,40 @@ def extract_ip(payload_bytes: bytes) -> str | None:
     return None
 
 
-def classify_request_error(exc: requests.RequestException) -> str:
+def classify_request_error(
+    exc: requests.RequestException,
+) -> tuple[str, bool]:
+    """Return (status, deterministic_for_current_protocol)."""
+    message = " ".join(str(exc).lower().split())
+
+    # CONNECT authentication failures are commonly raised as ProxyError rather
+    # than returned as a Response with status_code == 407.
+    if "407" in message and (
+        "proxy" in message
+        or "tunnel connection failed" in message
+        or "authentication required" in message
+    ):
+        return "proxy_auth_required", True
+
+    if isinstance(exc, requests.exceptions.InvalidProxyURL):
+        return "invalid_proxy_url", True
+    if isinstance(exc, requests.exceptions.InvalidSchema):
+        return "unsupported_proxy_scheme", True
     if isinstance(exc, requests.exceptions.ConnectTimeout):
-        return "connect_timeout"
+        return "connect_timeout", False
     if isinstance(exc, requests.exceptions.ReadTimeout):
-        return "read_timeout"
+        return "read_timeout", False
     if isinstance(exc, requests.exceptions.ProxyError):
-        return "proxy_error"
+        return "proxy_error", False
     if isinstance(exc, requests.exceptions.SSLError):
-        return "ssl_error"
+        return "ssl_error", False
     if isinstance(exc, requests.exceptions.ConnectionError):
-        return "connection_error"
+        return "connection_error", False
     if isinstance(exc, requests.exceptions.TooManyRedirects):
-        return "too_many_redirects"
-    return exc.__class__.__name__.lower()
+        return "too_many_redirects", False
+    if isinstance(exc, requests.exceptions.InvalidURL):
+        return "invalid_url", True
+    return exc.__class__.__name__.lower(), False
 
 
 def compact_error(exc: BaseException, limit: int = 300) -> str:
@@ -485,13 +550,14 @@ def bounded_request_timeout(
     connect_timeout: float,
     read_timeout: float,
     max_latency: float,
-) -> tuple[float, float]:
-    # requests has no true total wall-clock timeout. Bounding both socket
-    # phases by the latency limit prevents a single phase from exceeding the
-    # accepted total by a large margin.
-    return (
-        min(connect_timeout, max_latency),
-        min(read_timeout, max_latency),
+) -> urllib3.util.Timeout:
+    # requests accepts urllib3's Timeout object directly. A total budget makes
+    # the first response read account for time already spent connecting, while
+    # connect/read caps still retain the user's explicit phase limits.
+    return urllib3.util.Timeout(
+        total=max_latency,
+        connect=min(connect_timeout, max_latency),
+        read=min(read_timeout, max_latency),
     )
 
 
@@ -536,6 +602,11 @@ def check_proxy(
 
     last_status = "dead"
     last_error: str | None = None
+    last_protocol: str | None = None
+    last_endpoint: str | None = None
+    last_proxy_url: str | None = None
+    last_latency: float | None = None
+    last_ttfb: float | None = None
     attempts = 0
 
     rng = random.Random(os.urandom(16))
@@ -545,13 +616,28 @@ def check_proxy(
         max_latency=max_latency,
     )
 
+    def failure_result(status: str | None = None, error: str | None = None) -> CheckResult:
+        return CheckResult(
+            proxy=raw_proxy,
+            status=status or last_status,
+            protocol=last_protocol,
+            latency=last_latency,
+            ttfb=last_ttfb,
+            endpoint=last_endpoint,
+            canonical_url=last_proxy_url,
+            error=error if error is not None else last_error,
+            attempts=attempts,
+        )
+
     try:
         for protocol in candidate.protocols:
             if STOP_EVENT.is_set():
-                return CheckResult(raw_proxy, "cancelled", attempts=attempts)
+                return failure_result("cancelled")
 
             proxy_url = canonical_proxy_url(candidate, protocol)
             proxy_mapping = {"http": proxy_url, "https": proxy_url}
+            last_protocol = protocol
+            last_proxy_url = proxy_url
 
             skip_protocol = False
 
@@ -562,21 +648,18 @@ def check_proxy(
 
                 for endpoint in endpoints:
                     if STOP_EVENT.is_set():
-                        return CheckResult(
-                            raw_proxy,
-                            "cancelled",
-                            attempts=attempts,
-                        )
+                        return failure_result("cancelled")
 
                     if max_attempts and attempts >= max_attempts:
-                        return CheckResult(
-                            raw_proxy,
-                            last_status,
-                            error=last_error or "maximum attempts reached",
-                            attempts=attempts,
-                        )
+                        cap_error = "maximum attempts reached"
+                        if last_error:
+                            cap_error = f"{last_error}; {cap_error}"
+                        return failure_result(error=cap_error)
 
                     attempts += 1
+                    last_endpoint = endpoint
+                    last_latency = None
+                    last_ttfb = None
                     started = time.perf_counter()
 
                     try:
@@ -589,14 +672,13 @@ def check_proxy(
                             stream=True,
                         ) as response:
                             headers_received = time.perf_counter()
-                            ttfb = headers_received - started
+                            last_ttfb = headers_received - started
+                            last_latency = last_ttfb
 
                             if response.status_code != 200:
                                 if response.status_code == 407:
                                     last_status = "proxy_auth_required"
                                     last_error = "proxy returned HTTP 407"
-                                    # Authentication failure is deterministic
-                                    # for this protocol/credential tuple.
                                     skip_protocol = True
                                     break
 
@@ -606,32 +688,48 @@ def check_proxy(
                                 )
                                 continue
 
-                            if ttfb > max_latency:
+                            if last_ttfb > max_latency:
                                 last_status = "too_slow"
                                 last_error = (
-                                    f"TTFB {ttfb:.3f}s > {max_latency:.3f}s"
+                                    f"TTFB {last_ttfb:.3f}s > {max_latency:.3f}s"
                                 )
                                 continue
+
+                            # If body validation is disabled, a timely HTTP 200
+                            # is enough. Avoid spending time/bandwidth reading a
+                            # response that the caller explicitly does not need.
+                            if not require_ip:
+                                return CheckResult(
+                                    proxy=raw_proxy,
+                                    status="ok",
+                                    protocol=protocol,
+                                    latency=last_ttfb,
+                                    ttfb=last_ttfb,
+                                    endpoint=endpoint,
+                                    canonical_url=proxy_url,
+                                    attempts=attempts,
+                                )
 
                             body, deadline_exceeded = read_limited_response(
                                 response,
                                 MAX_RESPONSE_BYTES,
                                 deadline=started + max_latency,
                             )
-                            latency = time.perf_counter() - started
+                            last_latency = time.perf_counter() - started
 
-                            if deadline_exceeded or latency > max_latency:
+                            if deadline_exceeded or last_latency > max_latency:
                                 last_status = "too_slow"
                                 last_error = (
-                                    f"total {latency:.3f}s > {max_latency:.3f}s"
+                                    f"total {last_latency:.3f}s > {max_latency:.3f}s"
                                 )
                                 continue
 
                             exit_ip = extract_ip(body)
-                            if require_ip and exit_ip is None:
+                            if exit_ip is None:
                                 last_status = "invalid_response"
                                 last_error = (
-                                    "HTTP 200 received but no valid IP was found"
+                                    "HTTP 200 received but no valid IP was found "
+                                    f"in the first {MAX_RESPONSE_BYTES} bytes"
                                 )
                                 continue
 
@@ -639,8 +737,8 @@ def check_proxy(
                                 proxy=raw_proxy,
                                 status="ok",
                                 protocol=protocol,
-                                latency=latency,
-                                ttfb=ttfb,
+                                latency=last_latency,
+                                ttfb=last_ttfb,
                                 exit_ip=exit_ip,
                                 endpoint=endpoint,
                                 canonical_url=proxy_url,
@@ -648,9 +746,14 @@ def check_proxy(
                             )
 
                     except requests.RequestException as exc:
-                        last_status = classify_request_error(exc)
+                        last_latency = time.perf_counter() - started
+                        last_status, deterministic = classify_request_error(exc)
                         last_error = compact_error(exc)
+                        if deterministic:
+                            skip_protocol = True
+                            break
                     except Exception as exc:
+                        last_latency = time.perf_counter() - started
                         last_status = "unexpected_error"
                         last_error = (
                             f"{exc.__class__.__name__}: {compact_error(exc)}"
@@ -661,25 +764,17 @@ def check_proxy(
 
                 if retry_index < retries:
                     base_delay = retry_backoff * (2**retry_index)
-                    delay = base_delay + rng.uniform(
-                        0.0,
-                        max(0.001, base_delay * 0.25),
+                    delay = (
+                        base_delay + rng.uniform(0.0, base_delay * 0.25)
+                        if base_delay > 0
+                        else 0.0
                     )
                     if STOP_EVENT.wait(delay):
-                        return CheckResult(
-                            raw_proxy,
-                            "cancelled",
-                            attempts=attempts,
-                        )
+                        return failure_result("cancelled")
     finally:
         session.close()
 
-    return CheckResult(
-        raw_proxy,
-        last_status,
-        error=last_error,
-        attempts=attempts,
-    )
+    return failure_result()
 
 
 def iter_input_lines(path: Path) -> Iterator[str]:
@@ -742,8 +837,9 @@ def deduplicate_sqlite(
                 conn.execute("BEGIN")
                 pending = 0
 
+                cursor = conn.cursor()
                 for value in iter_input_lines(input_path):
-                    cursor = conn.execute(
+                    cursor.execute(
                         "INSERT OR IGNORE INTO seen(value) VALUES (?)",
                         (value,),
                     )
@@ -850,8 +946,22 @@ def positive_float(value: str) -> float:
         number = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError("must be finite")
     if number <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return number
+
+
+def non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError("must be finite")
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
     return number
 
 
@@ -862,14 +972,32 @@ def validate_test_urls(
     validated: list[str] = []
 
     for url in urls:
-        parsed = urlsplit(url)
-
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        if (
+            not url
+            or any(char.isspace() for char in url)
+            or any(ord(char) < 32 or ord(char) == 127 for char in url)
+        ):
             parser.error(f"invalid --test-url: {url!r}")
+
+        try:
+            parsed = urlsplit(url)
+            _ = parsed.port  # force validation of malformed/out-of-range ports
+        except ValueError as exc:
+            parser.error(f"invalid --test-url {url!r}: {exc}")
+
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            parser.error(f"invalid --test-url: {url!r}")
+        try:
+            validate_host(parsed.hostname)
+        except ValueError as exc:
+            parser.error(f"invalid --test-url {url!r}: {exc}")
         if parsed.username is not None or parsed.password is not None:
             parser.error(f"--test-url must not contain credentials: {url!r}")
+        if parsed.fragment:
+            parser.error(f"--test-url must not contain a fragment: {url!r}")
 
-        validated.append(url)
+        if url not in validated:
+            validated.append(url)
 
     if not validated:
         parser.error("at least one test URL is required")
@@ -928,7 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
             "0 means unlimited"
         ),
     )
-    parser.add_argument("--retry-backoff", type=positive_float, default=0.15)
+    parser.add_argument("--retry-backoff", type=non_negative_float, default=0.15)
     parser.add_argument("--max-latency", type=positive_float, default=8.0)
 
     parser.add_argument("--no-tcp-check", action="store_true")
@@ -1033,6 +1161,31 @@ def atomic_replace(
         fsync_directory(destination.parent)
 
 
+def atomic_write_text(
+    destination: Path,
+    text: str,
+    *,
+    durable: bool,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = create_temp_path(
+        destination.parent,
+        f".{destination.name}.",
+        ".tmp",
+    )
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            if durable:
+                fsync_file(handle)
+            else:
+                handle.flush()
+        atomic_replace(temp_path, destination, durable=durable)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def tsv_cell(value: object | None) -> str:
     if value is None:
         return ""
@@ -1071,6 +1224,12 @@ def write_detail(
     if redact_credentials and canonical_url:
         canonical_url = redact_proxy_value(canonical_url)
 
+    error = (
+        redact_error_text(result)
+        if redact_credentials
+        else result.error
+    )
+
     fields = (
         proxy_value,
         result.status,
@@ -1081,7 +1240,7 @@ def write_detail(
         result.endpoint,
         canonical_url,
         result.attempts,
-        result.error,
+        error,
     )
     handle.write("\t".join(tsv_cell(item) for item in fields) + "\n")
 
@@ -1152,10 +1311,9 @@ def run_checks(
     stats: Counter[str] = Counter()
     valid_results: list[CheckResult] = []
 
-    inflight_limit = max(
-        args.workers,
-        args.inflight or args.workers * 3,
-    )
+    # Honor an explicit --inflight value even when it is lower than --workers.
+    # This intentionally allows users to cap scheduled work below thread count.
+    inflight_limit = args.inflight or args.workers * 3
 
     futures: dict[Future[CheckResult], str] = {}
     source_iter = iter(source)
@@ -1339,14 +1497,16 @@ def main() -> int:
 
     if total == 0:
         try:
-            output_path.write_text("", encoding="utf-8")
-
+            atomic_write_text(
+                output_path,
+                "",
+                durable=args.durable_output,
+            )
             if args.details:
-                args.details.parent.mkdir(parents=True, exist_ok=True)
-                args.details.write_text(
-                    "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\t"
-                    "exit_ip\tendpoint\tcanonical_url\tattempts\terror\n",
-                    encoding="utf-8",
+                atomic_write_text(
+                    args.details,
+                    DETAILS_HEADER,
+                    durable=args.durable_output,
                 )
         finally:
             source_path.unlink(missing_ok=True)
@@ -1387,6 +1547,9 @@ def main() -> int:
     stats: Counter[str] = Counter()
     valid_results: list[CheckResult] = []
 
+    output_committed = False
+    details_committed = False
+
     try:
         with temp_output.open(
             "w",
@@ -1407,10 +1570,7 @@ def main() -> int:
 
             try:
                 if details_handle is not None:
-                    details_handle.write(
-                        "proxy\tstatus\tprotocol\tlatency_ms\tttfb_ms\t"
-                        "exit_ip\tendpoint\tcanonical_url\tattempts\terror\n"
-                    )
+                    details_handle.write(DETAILS_HEADER)
 
                 state, stats, valid_results = run_checks(
                     source,
@@ -1426,7 +1586,8 @@ def main() -> int:
                         key=lambda item: (
                             item.latency
                             if item.latency is not None
-                            else float("inf")
+                            else float("inf"),
+                            output_proxy_value(item, args.output_format),
                         )
                     )
                     for result in valid_results:
@@ -1456,6 +1617,7 @@ def main() -> int:
             output_path,
             durable=args.durable_output,
         )
+        output_committed = True
 
         if temp_details is not None and args.details is not None:
             atomic_replace(
@@ -1463,17 +1625,31 @@ def main() -> int:
                 args.details,
                 durable=args.durable_output,
             )
+            details_committed = True
 
     except BaseException:
-        print(
-            f"Partial valid results remain in: {temp_output}",
-            file=sys.stderr,
-        )
-        if temp_details is not None:
+        if temp_output.exists():
             print(
-                f"Partial details remain in: {temp_details}",
+                f"Partial valid results remain in: {temp_output}",
                 file=sys.stderr,
             )
+        elif output_committed:
+            print(
+                f"Output was already committed before the failure: {output_path}",
+                file=sys.stderr,
+            )
+
+        if temp_details is not None:
+            if temp_details.exists():
+                print(
+                    f"Partial details remain in: {temp_details}",
+                    file=sys.stderr,
+                )
+            elif details_committed and args.details is not None:
+                print(
+                    f"Details were already committed before the failure: {args.details}",
+                    file=sys.stderr,
+                )
         raise
     finally:
         source_path.unlink(missing_ok=True)
