@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Proxy Validator v13
+Proxy Validator v13.1
 
 Robust, bounded-concurrency validator for large HTTP, HTTPS-to-proxy,
 SOCKS4, SOCKS5 and SOCKS5h proxy lists.
@@ -45,7 +45,6 @@ SOCKS support requires:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import ipaddress
 import json
 import math
@@ -56,6 +55,7 @@ import signal
 import socket
 import sqlite3
 import sys
+from functools import lru_cache
 import tempfile
 import time
 from collections import Counter
@@ -71,7 +71,7 @@ import urllib3
 from requests.adapters import HTTPAdapter
 
 
-VERSION = "13.0"
+VERSION = "13.1"
 
 DEFAULT_TEST_URLS = (
     "https://api.ipify.org?format=json",
@@ -91,11 +91,12 @@ DETAILS_HEADER = (
 
 STOP_EVENT = Event()
 
+SCHEME_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 BRACKETED_AUTH_RE = re.compile(
     r"^\[(?P<host>[^\]]+)\]:(?P<port>\d+):(?P<user>[^:]*):(?P<password>.*)$"
 )
 URL_AUTH_RE = re.compile(
-    r"\b(?P<scheme>https?|socks4|socks5h?)://[^/@\s]+@",
+    r"\b(?P<scheme>https?|socks4|socks5h?)://[^@\s]+@",
     re.IGNORECASE,
 )
 
@@ -182,12 +183,19 @@ def validate_host(host: str) -> str:
     if any(char in host for char in "/?#@\\"):
         raise ValueError("host contains invalid URL characters")
 
-    # If it looks like an IP literal, validate it. Hostnames are left to the
-    # resolver because IDNA and private naming conventions vary by environment.
-    with contextlib.suppress(ValueError):
-        return str(ipaddress.ip_address(host))
+    # Colons are only valid in IPv6 literals, never ordinary DNS hostnames.
+    # Reject malformed IPv6 here instead of silently treating it as a hostname.
+    if ":" in host:
+        try:
+            return str(ipaddress.IPv6Address(host))
+        except ValueError as exc:
+            raise ValueError("invalid IPv6 address") from exc
 
-    return host
+    # Keep DNS names flexible for IDNA and private naming conventions.
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ValueError:
+        return host
 
 
 def validate_port(port_text: str | int) -> int:
@@ -220,6 +228,8 @@ def parse_host_port(value: str) -> tuple[str, int]:
         if value[end + 1 : end + 2] != ":":
             raise ValueError("missing port after bracketed IPv6 address")
         host = value[1:end]
+        if ":" not in host:
+            raise ValueError("brackets are only valid around IPv6 addresses")
         port_text = value[end + 2 :]
         if ":" in port_text:
             raise ValueError("unexpected extra fields after port")
@@ -240,7 +250,7 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
     if not raw:
         raise ValueError("empty line")
 
-    if "://" in raw:
+    if SCHEME_PREFIX_RE.match(raw):
         try:
             parsed = urlsplit(raw)
         except Exception as exc:
@@ -288,6 +298,8 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
 
     bracketed = BRACKETED_AUTH_RE.match(raw)
     if bracketed:
+        if ":" not in bracketed.group("host"):
+            raise ValueError("brackets are only valid around IPv6 addresses")
         return ProxyCandidate(
             raw,
             validate_host(bracketed.group("host")),
@@ -297,8 +309,17 @@ def parse_proxy_line(line: str, default_protocols: Sequence[str]) -> ProxyCandid
             tuple(default_protocols),
         )
 
+    # Do not interpret a full, unbracketed IPv6 literal as
+    # host:port:user:password just because its second hextet is numeric.
+    if ":" in raw and not raw.startswith("["):
+        try:
+            ipaddress.IPv6Address(raw)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("IPv6 addresses must be enclosed in brackets")
+
     # Common host:port:user:password form. Password may contain colons.
-    # Unbracketed IPv6 is not accepted here because it is ambiguous.
     parts = raw.split(":")
     if len(parts) >= 4 and not raw.startswith("["):
         host = parts[0].strip()
@@ -339,10 +360,13 @@ def output_proxy_value(result: CheckResult, mode: str) -> str:
 def redact_proxy_value(value: str) -> str:
     """Best-effort credential masking for logs/reports."""
     try:
-        if "://" in value:
+        if SCHEME_PREFIX_RE.match(value):
             parsed = urlsplit(value)
             if parsed.username is None:
-                return value
+                return URL_AUTH_RE.sub(
+                    lambda match: f"{match.group('scheme')}://***:***@",
+                    value,
+                )
 
             host = parsed.hostname or ""
             host = format_host_for_url(host)
@@ -362,8 +386,13 @@ def redact_proxy_value(value: str) -> str:
         parts = value.split(":")
         if len(parts) >= 4 and parts[1].isdigit():
             return f"{parts[0]}:{parts[1]}:***:***"
-    except Exception:
-        pass
+    except (ValueError, TypeError):
+        # A malformed URL (for example, a nonnumeric port) may be the very
+        # reason the proxy failed. Still mask its userinfo in diagnostics.
+        return URL_AUTH_RE.sub(
+            lambda match: f"{match.group('scheme')}://***:***@",
+            value,
+        )
 
     return value
 
@@ -586,6 +615,16 @@ def check_proxy(
     except (ValueError, TypeError) as exc:
         return CheckResult(raw_proxy, "invalid", error=compact_error(exc))
 
+    # A list may contain explicit SOCKS URLs even when --protocols contains
+    # only HTTP. Report this deterministically rather than retrying them.
+    if any(protocol in SOCKS_PROTOCOLS for protocol in candidate.protocols):
+        if not socks_dependency_available():
+            return CheckResult(
+                raw_proxy,
+                "unsupported_proxy_scheme",
+                error='PySocks is unavailable; install "requests[socks]"',
+            )
+
     if use_tcp_check:
         tcp_ok, tcp_error = tcp_check(candidate.host, candidate.port, tcp_timeout)
         if not tcp_ok:
@@ -800,7 +839,9 @@ def deduplicate_memory(
     duplicates = 0
 
     with source_path.open("w", encoding="utf-8", newline="\n") as output:
-        for value in iter_input_lines(input_path):
+        for index, value in enumerate(iter_input_lines(input_path)):
+            if index % 4096 == 0 and STOP_EVENT.is_set():
+                raise InterruptedError("input deduplication interrupted")
             if value in seen:
                 duplicates += 1
                 continue
@@ -838,7 +879,9 @@ def deduplicate_sqlite(
                 pending = 0
 
                 cursor = conn.cursor()
-                for value in iter_input_lines(input_path):
+                for index, value in enumerate(iter_input_lines(input_path)):
+                    if index % 4096 == 0 and STOP_EVENT.is_set():
+                        raise InterruptedError("input deduplication interrupted")
                     cursor.execute(
                         "INSERT OR IGNORE INTO seen(value) VALUES (?)",
                         (value,),
@@ -981,7 +1024,9 @@ def validate_test_urls(
 
         try:
             parsed = urlsplit(url)
-            _ = parsed.port  # force validation of malformed/out-of-range ports
+            port = parsed.port  # force validation of malformed/out-of-range ports
+            if port is not None:
+                validate_port(port)
         except ValueError as exc:
             parser.error(f"invalid --test-url {url!r}: {exc}")
 
@@ -992,7 +1037,7 @@ def validate_test_urls(
         except ValueError as exc:
             parser.error(f"invalid --test-url {url!r}: {exc}")
         if parsed.username is not None or parsed.password is not None:
-            parser.error(f"--test-url must not contain credentials: {url!r}")
+            parser.error("--test-url must not contain credentials")
         if parsed.fragment:
             parser.error(f"--test-url must not contain a fragment: {url!r}")
 
@@ -1005,6 +1050,7 @@ def validate_test_urls(
     return tuple(validated)
 
 
+@lru_cache(maxsize=1)
 def socks_dependency_available() -> bool:
     try:
         import socks  # type: ignore[import-not-found]  # noqa: F401
@@ -1488,12 +1534,16 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("Preparing unique proxy list...", flush=True)
-    source_path, total, duplicates, dedup_mode = prepare_unique_source(
-        input_path,
-        output_path.parent,
-        mode=args.dedup_mode,
-        memory_threshold_mb=args.dedup_memory_threshold_mb,
-    )
+    try:
+        source_path, total, duplicates, dedup_mode = prepare_unique_source(
+            input_path,
+            output_path.parent,
+            mode=args.dedup_mode,
+            memory_threshold_mb=args.dedup_memory_threshold_mb,
+        )
+    except InterruptedError:
+        print("Input preparation interrupted; no output was replaced.", file=sys.stderr)
+        return 130
 
     if total == 0:
         try:
@@ -1520,28 +1570,8 @@ def main() -> int:
         flush=True,
     )
 
-    if args.shuffle:
-        source_list = list(iter_input_lines(source_path))
-        random.SystemRandom().shuffle(source_list)
-        source: Iterable[str] = source_list
-    else:
-        source = iter_input_lines(source_path)
-
-    temp_output = create_temp_path(
-        output_path.parent,
-        f".{output_path.name}.",
-        ".tmp",
-    )
-
+    temp_output: Path | None = None
     temp_details: Path | None = None
-    if args.details:
-        args.details.parent.mkdir(parents=True, exist_ok=True)
-        temp_details = create_temp_path(
-            args.details.parent,
-            f".{args.details.name}.",
-            ".tmp",
-        )
-
     started = time.perf_counter()
     state = RunState()
     stats: Counter[str] = Counter()
@@ -1551,6 +1581,27 @@ def main() -> int:
     details_committed = False
 
     try:
+        if args.shuffle:
+            source_list = list(iter_input_lines(source_path))
+            random.SystemRandom().shuffle(source_list)
+            source: Iterable[str] = source_list
+        else:
+            source = iter_input_lines(source_path)
+
+        temp_output = create_temp_path(
+            output_path.parent,
+            f".{output_path.name}.",
+            ".tmp",
+        )
+
+        if args.details:
+            args.details.parent.mkdir(parents=True, exist_ok=True)
+            temp_details = create_temp_path(
+                args.details.parent,
+                f".{args.details.name}.",
+                ".tmp",
+            )
+
         with temp_output.open(
             "w",
             encoding="utf-8",
@@ -1628,7 +1679,7 @@ def main() -> int:
             details_committed = True
 
     except BaseException:
-        if temp_output.exists():
+        if temp_output is not None and temp_output.exists():
             print(
                 f"Partial valid results remain in: {temp_output}",
                 file=sys.stderr,
